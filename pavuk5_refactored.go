@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,8 +11,6 @@ import (
 	"log"
 	"math"
 	"math/rand"
-	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -30,6 +27,10 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"golang.org/x/net/html/charset"
 	"golang.org/x/time/rate"
+
+	http2 "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
 )
 
 // ============================================================================
@@ -38,6 +39,8 @@ import (
 
 type Config struct {
 	WorkersPerDomain   int           `json:"workers_per_domain"`
+	ProxiesFile        string        `json:"proxies_file"`
+	Proxies            []string      `json:"-"`
 	MaxTotalWorkers    int           `json:"max_total_workers"`
 	MaxPagesPerDomain  int           `json:"max_pages_per_domain"`
 	RequestTimeout     time.Duration `json:"request_timeout"`
@@ -52,8 +55,8 @@ type Config struct {
 
 func DefaultConfig() *Config {
 	return &Config{
-		WorkersPerDomain:   3,
-		MaxTotalWorkers:    300,
+		WorkersPerDomain:   1,
+		MaxTotalWorkers:    500,
 		MaxPagesPerDomain:  1000,
 		RequestTimeout:     90 * time.Second,
 		DomainTimeout:      30 * time.Minute,
@@ -75,25 +78,30 @@ func DefaultConfig() *Config {
 // ============================================================================
 
 type Finding struct {
-	Domain         string    `json:"domain"`
-	URL            string    `json:"url"`
-	Method         string    `json:"method"`
-	System         string    `json:"system"`
-	Confidence     float64   `json:"confidence"`
-	Tier           int       `json:"tier"`
-	HasTextarea    bool      `json:"has_textarea"`
-	TextareaCount  int       `json:"textarea_count"`
-	Signals        []string  `json:"signals"`
-	Timestamp      time.Time `json:"timestamp"`
-	PageContext    float64   `json:"page_context"`    // NEW: контекст страницы
-	URLWeight      float64   `json:"url_weight"`       // NEW: вес URL
-	FormSemantics  float64   `json:"form_semantics"`   // NEW: семантика формы
+	Domain        string    `json:"domain"`
+	URL           string    `json:"url"`
+	Method        string    `json:"method"`
+	System        string    `json:"system"`
+	Confidence    float64   `json:"confidence"`
+	Tier          int       `json:"tier"`
+	HasTextarea   bool      `json:"has_textarea"`
+	Category      string    `json:"category"`
+	Emails        []string  `json:"emails,omitempty"`
+	SiteName      string    `json:"site_name,omitempty"`
+	ErrorCode     int       `json:"error_code,omitempty"`
+	ErrorMessage  string    `json:"error_message,omitempty"`
+	TextareaCount int       `json:"textarea_count"`
+	Signals       []string  `json:"signals"`
+	Timestamp     time.Time `json:"timestamp"`
+	PageContext   float64   `json:"page_context"`   // NEW: контекст страницы
+	URLWeight     float64   `json:"url_weight"`     // NEW: вес URL
+	FormSemantics float64   `json:"form_semantics"` // NEW: семантика формы
 }
 
 type DomainCrawler struct {
 	domain      string
 	config      *Config
-	client      *http.Client
+	client      tls_client.HttpClient
 	rateLimiter *rate.Limiter
 	visited     sync.Map
 	queue       chan string
@@ -101,19 +109,19 @@ type DomainCrawler struct {
 	errors      int64
 	pages       int64
 	found       int64
-	
-	timeoutErrors   int64
-	networkErrors   int64
-	parseErrors     int64
-	notFoundErrors  int64
-	
+
+	timeoutErrors  int64
+	networkErrors  int64
+	parseErrors    int64
+	notFoundErrors int64
+
 	// Pattern tracking для адаптивного поиска
-	successPatterns sync.Map  // URL паттерны где нашли комментарии
-	patternCounts   sync.Map  // Счетчики успешных паттернов
-	
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+	successPatterns sync.Map // URL паттерны где нашли комментарии
+	patternCounts   sync.Map // Счетчики успешных паттернов
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 type MainCrawler struct {
@@ -123,36 +131,36 @@ type MainCrawler struct {
 	results        chan *Finding
 	checkpoint     *Checkpoint
 	checkpointMu   sync.RWMutex
-	outputFile     *os.File
-	outputMu       sync.Mutex
-	
-	tier1File      *os.File
-	tier2File      *os.File
-	tier3File      *os.File
-	tier4File      *os.File
-	
-	tierCounts     [5]int64
-	
-	startTime      time.Time
-	domainsTotal   int64
-	domainsActive  int64
-	domainsDone    int64
+
+	commentsFile *os.File
+	emailsFile   *os.File
+	forumsFile   *os.File
+	contactsFile *os.File
+	errorsFile   *os.File
+	outputMu     sync.Mutex
+
+	categoryCounts map[string]int64
+
+	startTime           time.Time
+	domainsTotal        int64
+	domainsActive       int64
+	domainsDone         int64
 	domainsWithComments int64
-	pagesTotal     int64
-	findingsTotal  int64
-	errorsTotal    int64
-	
-	errorTypes     sync.Map
-	
+	pagesTotal          int64
+	findingsTotal       int64
+	errorsTotal         int64
+
+	errorTypes sync.Map
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
 type Checkpoint struct {
-	ProcessedDomains map[string]bool   `json:"processed_domains"`
-	Statistics       map[string]int64  `json:"statistics"`
-	Timestamp        time.Time         `json:"timestamp"`
+	ProcessedDomains map[string]bool  `json:"processed_domains"`
+	Statistics       map[string]int64 `json:"statistics"`
+	Timestamp        time.Time        `json:"timestamp"`
 }
 
 // ============================================================================
@@ -162,7 +170,7 @@ type Checkpoint struct {
 // analyzeURLContext - анализирует URL для определения вероятности наличия комментариев
 func analyzeURLContext(urlStr string) (contextType string, weight float64) {
 	urlLower := strings.ToLower(urlStr)
-	
+
 	// Паттерны с весами
 	patterns := []struct {
 		pattern string
@@ -177,13 +185,13 @@ func analyzeURLContext(urlStr string) (contextType string, weight float64) {
 		{`/\d{4}/\d{2}/`, 0.35, true}, // даты в URL
 		{"/entry/", 0.3, false},
 		{"/story/", 0.3, false},
-		
+
 		// Средняя вероятность
 		{"/review", 0.2, false},
 		{"/product/", 0.15, false},
 		{"/topic/", 0.2, false},
 		{"/discussion/", 0.3, false},
-		
+
 		// Низкая вероятность (но не исключаем)
 		{"/contact", -0.3, false},
 		{"/about", -0.2, false},
@@ -191,7 +199,7 @@ func analyzeURLContext(urlStr string) (contextType string, weight float64) {
 		{"/category/", -0.15, false},
 		{"/tag/", -0.15, false},
 		{"/archive/", -0.1, false},
-		
+
 		// Системные страницы
 		{"/login", -0.5, false},
 		{"/register", -0.5, false},
@@ -206,10 +214,10 @@ func analyzeURLContext(urlStr string) (contextType string, weight float64) {
 		{"/help", -0.3, false},
 		{"/faq", -0.3, false},
 	}
-	
+
 	totalWeight := 0.0
 	matchCount := 0
-	
+
 	for _, p := range patterns {
 		matched := false
 		if p.isRegex {
@@ -221,15 +229,15 @@ func analyzeURLContext(urlStr string) (contextType string, weight float64) {
 				matched = true
 			}
 		}
-		
+
 		if matched {
 			totalWeight += p.weight
 			matchCount++
 		}
 	}
-	
+
 	// Веса накапливаются без нормализации для сохранения силы множественных сигналов
-	
+
 	// Определяем тип контекста
 	if totalWeight > 0.2 {
 		contextType = "content"
@@ -238,14 +246,14 @@ func analyzeURLContext(urlStr string) (contextType string, weight float64) {
 	} else {
 		contextType = "neutral"
 	}
-	
+
 	return contextType, totalWeight
 }
 
 // analyzePageStructure - анализирует структуру страницы для поиска паттернов комментариев
 func analyzePageStructure(doc *goquery.Document) float64 {
 	score := 0.0
-	
+
 	// Паттерн 1: Последовательность однотипных блоков (возможно комментарии)
 	repeatingBlocks := findRepeatingStructures(doc)
 	if repeatingBlocks > 5 {
@@ -253,7 +261,7 @@ func analyzePageStructure(doc *goquery.Document) float64 {
 	} else if repeatingBlocks > 3 {
 		score += 0.15
 	}
-	
+
 	// Паттерн 2: Временные метки рядом с текстовыми блоками
 	timestampCount := 0
 	doc.Find("time, .date, .timestamp, [datetime], .posted, .published").Each(func(i int, s *goquery.Selection) {
@@ -263,13 +271,13 @@ func analyzePageStructure(doc *goquery.Document) float64 {
 			timestampCount++
 		}
 	})
-	
+
 	if timestampCount > 3 {
 		score += 0.3
 	} else if timestampCount > 1 {
 		score += 0.15
 	}
-	
+
 	// Паттерн 3: Вложенность структур (threading)
 	nestedStructures := doc.Find(".reply, .children, .nested, .thread, .indent, [style*='margin-left'], .level-2, .depth-2")
 	if nestedStructures.Length() > 2 {
@@ -277,19 +285,19 @@ func analyzePageStructure(doc *goquery.Document) float64 {
 	} else if nestedStructures.Length() > 0 {
 		score += 0.2
 	}
-	
+
 	// Паттерн 4: Наличие аватаров/имён пользователей
 	userIndicators := doc.Find(".avatar, .user, .author, .commenter, .username, .profile-pic, img[alt*='avatar']")
 	if userIndicators.Length() > 3 {
 		score += 0.2
 	}
-	
+
 	// Паттерн 5: Счётчики комментариев
 	counterPatterns := []string{
 		"comments", "комментари", "отзыв", "обсужден",
 		"responses", "replies", "discussion",
 	}
-	
+
 	doc.Find("span, div, a").Each(func(i int, s *goquery.Selection) {
 		text := strings.ToLower(s.Text())
 		for _, pattern := range counterPatterns {
@@ -299,43 +307,43 @@ func analyzePageStructure(doc *goquery.Document) float64 {
 			}
 		}
 	})
-	
+
 	// Паттерн 6: Кнопки ответа/цитирования
 	replyButtons := doc.Find("button, a").FilterFunction(func(i int, s *goquery.Selection) bool {
 		text := strings.ToLower(s.Text())
-		return strings.Contains(text, "reply") || 
-		       strings.Contains(text, "ответить") ||
-		       strings.Contains(text, "quote") ||
-		       strings.Contains(text, "цитировать")
+		return strings.Contains(text, "reply") ||
+			strings.Contains(text, "ответить") ||
+			strings.Contains(text, "quote") ||
+			strings.Contains(text, "цитировать")
 	})
-	
+
 	if replyButtons.Length() > 2 {
 		score += 0.25
 	}
-	
+
 	return math.Min(score, 1.0) // Ограничиваем максимум
 }
 
 // findRepeatingStructures - находит повторяющиеся структуры на странице
 func findRepeatingStructures(doc *goquery.Document) int {
 	classCount := make(map[string]int)
-	
+
 	// Ищем div, article, section с классами
 	doc.Find("div[class], article[class], section[class], li[class]").Each(func(i int, s *goquery.Selection) {
 		class, exists := s.Attr("class")
 		if !exists || class == "" {
 			return
 		}
-		
+
 		// Игнорируем обёртки и контейнеры
 		classLower := strings.ToLower(class)
-		if strings.Contains(classLower, "wrapper") || 
-		   strings.Contains(classLower, "container") ||
-		   strings.Contains(classLower, "row") ||
-		   strings.Contains(classLower, "col-") {
+		if strings.Contains(classLower, "wrapper") ||
+			strings.Contains(classLower, "container") ||
+			strings.Contains(classLower, "row") ||
+			strings.Contains(classLower, "col-") {
 			return
 		}
-		
+
 		// Считаем только значимые классы
 		classes := strings.Fields(class)
 		for _, c := range classes {
@@ -344,7 +352,7 @@ func findRepeatingStructures(doc *goquery.Document) int {
 			}
 		}
 	})
-	
+
 	// Находим максимальное количество повторений
 	maxRepeat := 0
 	for _, count := range classCount {
@@ -352,14 +360,14 @@ func findRepeatingStructures(doc *goquery.Document) int {
 			maxRepeat = count
 		}
 	}
-	
+
 	return maxRepeat
 }
 
 // analyzeFormSemantics - семантический анализ формы в контексте страницы
 func analyzeFormSemantics(form *goquery.Selection, pageDoc *goquery.Document) float64 {
 	score := 0.0
-	
+
 	// 1. Анализ заголовка/текста ПЕРЕД формой
 	prevAll := form.PrevAll()
 	prevText := ""
@@ -368,7 +376,7 @@ func analyzeFormSemantics(form *goquery.Selection, pageDoc *goquery.Document) fl
 			prevText += " " + strings.ToLower(s.Text())
 		}
 	})
-	
+
 	// Позитивные индикаторы для комментариев
 	commentKeywords := []string{
 		"leave a comment", "add comment", "post comment",
@@ -378,7 +386,7 @@ func analyzeFormSemantics(form *goquery.Selection, pageDoc *goquery.Document) fl
 		"ваше мнение", "поделитесь мыслями",
 		"write a review", "leave feedback",
 	}
-	
+
 	// Негативные индикаторы (контактные формы)
 	contactKeywords := []string{
 		"contact us", "get in touch", "reach out",
@@ -386,53 +394,53 @@ func analyzeFormSemantics(form *goquery.Selection, pageDoc *goquery.Document) fl
 		"свяжитесь с нами", "написать нам", "обратная связь",
 		"задать вопрос", "техподдержка",
 	}
-	
+
 	for _, kw := range commentKeywords {
 		if strings.Contains(prevText, kw) {
 			score += 0.35
 			break
 		}
 	}
-	
+
 	for _, kw := range contactKeywords {
 		if strings.Contains(prevText, kw) {
 			score -= 0.4
 			break
 		}
 	}
-	
+
 	// 2. Анализ полей формы
 	textareas := form.Find("textarea")
 	inputs := form.Find("input[type!='hidden']")
 	selects := form.Find("select")
-	
+
 	// Проверяем имена и placeholder у textarea
 	hasGoodTextarea := false
 	textareas.Each(func(i int, ta *goquery.Selection) {
 		name := strings.ToLower(ta.AttrOr("name", ""))
 		placeholder := strings.ToLower(ta.AttrOr("placeholder", ""))
 		id := strings.ToLower(ta.AttrOr("id", ""))
-		
-		if strings.Contains(name, "comment") || 
-		   strings.Contains(placeholder, "comment") ||
-		   strings.Contains(id, "comment") {
+
+		if strings.Contains(name, "comment") ||
+			strings.Contains(placeholder, "comment") ||
+			strings.Contains(id, "comment") {
 			hasGoodTextarea = true
 			score += 0.3
-		} else if strings.Contains(name, "message") || 
-		          strings.Contains(name, "text") ||
-		          strings.Contains(name, "content") {
+		} else if strings.Contains(name, "message") ||
+			strings.Contains(name, "text") ||
+			strings.Contains(name, "content") {
 			score += 0.15
 		} else if strings.Contains(name, "body") ||
-		          strings.Contains(name, "reply") {
+			strings.Contains(name, "reply") {
 			score += 0.2
 		}
 	})
-	
+
 	// Используем hasGoodTextarea для дополнительной проверки
 	if hasGoodTextarea {
 		score += 0.1 // Бонус за правильное имя textarea
 	}
-	
+
 	// Анализ input полей
 	hasEmail := false
 	hasName := false
@@ -440,14 +448,14 @@ func analyzeFormSemantics(form *goquery.Selection, pageDoc *goquery.Document) fl
 	hasSubject := false
 	hasWebsite := false
 	hasCompany := false
-	
+
 	inputs.Each(func(i int, inp *goquery.Selection) {
 		inputType := strings.ToLower(inp.AttrOr("type", "text"))
 		name := strings.ToLower(inp.AttrOr("name", ""))
 		placeholder := strings.ToLower(inp.AttrOr("placeholder", ""))
-		
+
 		combined := name + " " + placeholder + " " + inputType
-		
+
 		if strings.Contains(combined, "email") || inputType == "email" {
 			hasEmail = true
 		}
@@ -467,7 +475,7 @@ func analyzeFormSemantics(form *goquery.Selection, pageDoc *goquery.Document) fl
 			hasCompany = true
 		}
 	})
-	
+
 	// Паттерн комментарной формы: name + email + website (опционально) + textarea
 	if hasName && hasEmail && !hasPhone && !hasSubject && !hasCompany {
 		score += 0.3
@@ -475,7 +483,7 @@ func analyzeFormSemantics(form *goquery.Selection, pageDoc *goquery.Document) fl
 			score += 0.1 // URL поле часто в комментариях
 		}
 	}
-	
+
 	// Паттерн контактной формы: phone или subject или company
 	if hasPhone {
 		score -= 0.4
@@ -486,55 +494,55 @@ func analyzeFormSemantics(form *goquery.Selection, pageDoc *goquery.Document) fl
 	if hasCompany {
 		score -= 0.3
 	}
-	
+
 	// Наличие селектов часто указывает на контактную форму
 	if selects.Length() > 0 {
 		score -= 0.2
 	}
-	
+
 	// 3. Проверка кнопки отправки
 	submitBtn := form.Find("button[type='submit'], input[type='submit'], button:not([type='button'])")
 	submitText := strings.ToLower(submitBtn.Text() + " " + submitBtn.AttrOr("value", ""))
-	
+
 	if strings.Contains(submitText, "post comment") ||
-	   strings.Contains(submitText, "add comment") ||
-	   strings.Contains(submitText, "submit comment") ||
-	   strings.Contains(submitText, "отправить комментарий") {
+		strings.Contains(submitText, "add comment") ||
+		strings.Contains(submitText, "submit comment") ||
+		strings.Contains(submitText, "отправить комментарий") {
 		score += 0.25
 	} else if strings.Contains(submitText, "send") ||
-	          strings.Contains(submitText, "submit") ||
-	          strings.Contains(submitText, "отправить") {
+		strings.Contains(submitText, "submit") ||
+		strings.Contains(submitText, "отправить") {
 		// Нейтральная кнопка
 		score += 0.05
 	}
-	
+
 	// 4. Позиция формы на странице
 	formParent := form.Parent()
-	
+
 	// Проверяем, находится ли форма внутри статьи
 	if formParent.Closest("article, .article, .post, .entry, .content, main").Length() > 0 {
 		score += WEIGHT_MEDIUM
 	}
-	
+
 	// Проверяем наличие заголовка комментариев перед формой
 	// Ищем в пределах того же родителя
 	headings := formParent.Find("h2, h3, h4, .section-title")
 	headings.Each(func(i int, h *goquery.Selection) {
 		text := strings.ToLower(h.Text())
-		if strings.Contains(text, "comment") || 
-		   strings.Contains(text, "discussion") ||
-		   strings.Contains(text, "leave") ||
-		   strings.Contains(text, "reply") {
+		if strings.Contains(text, "comment") ||
+			strings.Contains(text, "discussion") ||
+			strings.Contains(text, "leave") ||
+			strings.Contains(text, "reply") {
 			score += WEIGHT_MEDIUM
 			return // прерываем цикл
 		}
 	})
-	
+
 	// Проверяем есть ли комментарии рядом с формой
 	if formParent.Find(".comment, .comments-list, .discussion").Length() > 0 {
 		score += WEIGHT_STRONG
 	}
-	
+
 	return math.Min(math.Max(score, -1.0), 1.0) // Ограничиваем диапазон [-1, 1]
 }
 
@@ -542,41 +550,41 @@ func analyzeFormSemantics(form *goquery.Selection, pageDoc *goquery.Document) fl
 func categorizeSignals(signals []string) (strong, weak, negative int) {
 	for _, sig := range signals {
 		sigLower := strings.ToLower(sig)
-		
+
 		// Сильные позитивные сигналы
 		if strings.Contains(sigLower, "existing_comments") ||
-		   strings.Contains(sigLower, "button_post_comment") ||
-		   strings.Contains(sigLower, "textarea_comment") ||
-		   strings.Contains(sigLower, "comment_section") ||
-		   strings.Contains(sigLower, "reply_button") ||
-		   strings.Contains(sigLower, "thread_structure") ||
-		   strings.Contains(sigLower, "modern_system") ||
-		   strings.Contains(sigLower, "schema_org") ||
-		   strings.Contains(sigLower, "wordpress_comments") {
+			strings.Contains(sigLower, "button_post_comment") ||
+			strings.Contains(sigLower, "textarea_comment") ||
+			strings.Contains(sigLower, "comment_section") ||
+			strings.Contains(sigLower, "reply_button") ||
+			strings.Contains(sigLower, "thread_structure") ||
+			strings.Contains(sigLower, "modern_system") ||
+			strings.Contains(sigLower, "schema_org") ||
+			strings.Contains(sigLower, "wordpress_comments") {
 			strong++
 		} else if strings.Contains(sigLower, "in_article") ||
-		          strings.Contains(sigLower, "simple_form") ||
-		          strings.Contains(sigLower, "has_author") ||
-		          strings.Contains(sigLower, "timestamp") ||
-		          strings.Contains(sigLower, "content_url") {
+			strings.Contains(sigLower, "simple_form") ||
+			strings.Contains(sigLower, "has_author") ||
+			strings.Contains(sigLower, "timestamp") ||
+			strings.Contains(sigLower, "content_url") {
 			weak++
 		} else if strings.Contains(sigLower, "has_phone") ||
-		          strings.Contains(sigLower, "has_subject") ||
-		          strings.Contains(sigLower, "contact") ||
-		          strings.Contains(sigLower, "complex_form") ||
-		          strings.Contains(sigLower, "has_company") {
+			strings.Contains(sigLower, "has_subject") ||
+			strings.Contains(sigLower, "contact") ||
+			strings.Contains(sigLower, "complex_form") ||
+			strings.Contains(sigLower, "has_company") {
 			negative++
 		}
 	}
-	
+
 	return strong, weak, negative
 }
 
 // Константы для категорий весов
 const (
-	WEIGHT_STRONG = 0.3
-	WEIGHT_MEDIUM = 0.15
-	WEIGHT_WEAK   = 0.05
+	WEIGHT_STRONG   = 0.3
+	WEIGHT_MEDIUM   = 0.15
+	WEIGHT_WEAK     = 0.05
 	WEIGHT_NEGATIVE = -0.3
 )
 
@@ -587,13 +595,13 @@ const (
 func classifyFindingTierV2(finding *Finding, doc *goquery.Document) int {
 	// Анализируем URL контекст (уже должен быть заполнен)
 	urlScore := finding.URLWeight
-	
+
 	// Анализируем структуру страницы (уже должен быть заполнен)
 	pageScore := finding.PageContext
-	
+
 	// Анализируем семантику формы (уже должен быть заполнен)
 	formScore := finding.FormSemantics
-	
+
 	// Доверие к методу детектирования
 	methodTrust := 0.0
 	switch finding.Method {
@@ -606,11 +614,11 @@ func classifyFindingTierV2(finding *Finding, doc *goquery.Document) int {
 	case "placeholder":
 		methodTrust = 0.3
 	}
-	
+
 	// Анализ сигналов
 	strongCount, weakCount, negCount := categorizeSignals(finding.Signals)
 	signalScore := float64(strongCount)*0.4 + float64(weakCount)*0.15 - float64(negCount)*0.5
-	
+
 	// Взвешенная сумма факторов
 	weights := map[string]float64{
 		"url":     0.15,
@@ -619,16 +627,16 @@ func classifyFindingTierV2(finding *Finding, doc *goquery.Document) int {
 		"method":  0.25,
 		"signals": 0.15,
 	}
-	
+
 	totalScore := urlScore*weights["url"] +
-	              pageScore*weights["page"] +
-	              formScore*weights["form"] +
-	              methodTrust*weights["method"] +
-	              signalScore*weights["signals"]
-	
+		pageScore*weights["page"] +
+		formScore*weights["form"] +
+		methodTrust*weights["method"] +
+		signalScore*weights["signals"]
+
 	// Дополнительная проверка confidence
 	totalScore = (totalScore + finding.Confidence) / 2
-	
+
 	// Классификация по общему баллу
 	if totalScore >= 0.75 {
 		return 1 // Определённо комментарии
@@ -637,7 +645,7 @@ func classifyFindingTierV2(finding *Finding, doc *goquery.Document) int {
 	} else if totalScore >= 0.25 {
 		return 3 // Возможно комментарии
 	}
-	
+
 	return 4 // Сомнительно
 }
 
@@ -647,30 +655,26 @@ func classifyFindingTierV2(finding *Finding, doc *goquery.Document) int {
 
 func NewDomainCrawler(domain string, config *Config, results chan *Finding) *DomainCrawler {
 	ctx, cancel := context.WithTimeout(context.Background(), config.DomainTimeout)
-	
-	transport := &http.Transport{
-		MaxIdleConns:        10,
-		MaxIdleConnsPerHost: config.WorkersPerDomain,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 60 * time.Second,
-		}).DialContext,
+
+	options := []tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(int(config.RequestTimeout.Seconds())),
+		tls_client.WithClientProfile(profiles.Chrome_120),
+		tls_client.WithNotFollowRedirects(),
+		tls_client.WithInsecureSkipVerify(),
 	}
-	
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   config.RequestTimeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return fmt.Errorf("too many redirects")
-			}
-			return nil
-		},
+
+	if len(config.Proxies) > 0 {
+		proxy := config.Proxies[rand.Intn(len(config.Proxies))]
+		options = append(options, tls_client.WithProxyUrl(proxy))
 	}
-	
+
+	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	if err != nil {
+		log.Printf("[%s] Failed to create tls client: %v", domain, err)
+		// Fallback to default client
+		client, _ = tls_client.NewHttpClient(tls_client.NewNoopLogger())
+	}
+
 	return &DomainCrawler{
 		domain:      domain,
 		config:      config,
@@ -688,16 +692,16 @@ func (dc *DomainCrawler) Start() {
 		dc.wg.Add(1)
 		go dc.worker(i)
 	}
-	
+
 	dc.seedInitialURLs()
-	
+
 	dc.wg.Add(1)
 	go dc.monitor()
 }
 
 func (dc *DomainCrawler) seedInitialURLs() {
 	mainURL := "https://" + dc.domain
-	
+
 	doc, finalURL, err := dc.fetchAndParse(mainURL)
 	if err != nil {
 		mainURL = "http://" + dc.domain
@@ -705,7 +709,7 @@ func (dc *DomainCrawler) seedInitialURLs() {
 		if err != nil {
 			log.Printf("[%s] Main page failed, trying sitemap", dc.domain)
 			dc.processSitemap()
-			
+
 			if len(dc.queue) == 0 {
 				log.Printf("[%s] No accessible pages found", dc.domain)
 				dc.cancel()
@@ -714,12 +718,12 @@ func (dc *DomainCrawler) seedInitialURLs() {
 			return
 		}
 	}
-	
+
 	dc.visited.Store(finalURL, true)
 	atomic.AddInt64(&dc.pages, 1)
-	
+
 	dc.detectComments(doc, finalURL)
-	
+
 	links := dc.extractLinks(doc, finalURL)
 	prioritized := dc.prioritizeLinks(links)
 	for _, link := range prioritized {
@@ -728,13 +732,13 @@ func (dc *DomainCrawler) seedInitialURLs() {
 		default:
 		}
 	}
-	
+
 	dc.processSitemap()
 }
 
 func (dc *DomainCrawler) worker(id int) {
 	defer dc.wg.Done()
-	
+
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[%s] Worker %d recovered from panic: %v", dc.domain, id, r)
@@ -742,37 +746,37 @@ func (dc *DomainCrawler) worker(id int) {
 			go dc.worker(id)
 		}
 	}()
-	
+
 	for {
 		select {
 		case <-dc.ctx.Done():
 			return
-			
+
 		case url := <-dc.queue:
 			if url == "" {
 				continue
 			}
-			
+
 			if _, visited := dc.visited.LoadOrStore(url, true); visited {
 				continue
 			}
-			
+
 			if atomic.LoadInt64(&dc.pages) >= int64(dc.config.MaxPagesPerDomain) {
 				continue
 			}
-			
+
 			dc.rateLimiter.Wait(dc.ctx)
 			dc.processURL(url)
-			
+
 			pages := atomic.LoadInt64(&dc.pages)
 			found := atomic.LoadInt64(&dc.found)
-			
+
 			if found >= 50 {
 				log.Printf("[%s] Found enough comments (%d pages), stopping", dc.domain, found)
 				dc.cancel()
 				return
 			}
-			
+
 			if pages >= int64(dc.config.MaxPagesPerDomain) {
 				log.Printf("[%s] Reached page limit (%d), found %d comments", dc.domain, pages, found)
 				dc.cancel()
@@ -784,77 +788,99 @@ func (dc *DomainCrawler) worker(id int) {
 
 func (dc *DomainCrawler) processURL(url string) {
 	atomic.AddInt64(&dc.pages, 1)
-	
+
 	doc, finalURL, err := dc.fetchAndParse(url)
 	if err != nil {
 		atomic.AddInt64(&dc.errors, 1)
 		errStr := err.Error()
-		
+
+		errorCode := 0
+		if strings.Contains(errStr, "status ") {
+			parts := strings.Split(errStr, "status ")
+			if len(parts) > 1 {
+				errorCode, _ = strconv.Atoi(strings.TrimSpace(parts[1]))
+			}
+		} else if strings.Contains(errStr, "timeout") {
+			errorCode = 408
+		} else {
+			errorCode = 500
+		}
+
+		// Логируем ошибку как Finding для errors.jsonl
+		errorFinding := &Finding{
+			Domain:       dc.domain,
+			URL:          url,
+			Category:     "error",
+			ErrorCode:    errorCode,
+			ErrorMessage: errStr,
+			Timestamp:    time.Now(),
+		}
+		dc.results <- errorFinding
+
 		// Детальное логирование ошибок
 		if strings.Contains(errStr, "timeout") {
 			atomic.AddInt64(&dc.timeoutErrors, 1)
-			log.Printf("[%s] Timeout error on %s: %v", dc.domain, url, err)
 		} else if strings.Contains(errStr, "status 404") {
 			atomic.AddInt64(&dc.notFoundErrors, 1)
-			// 404 не логируем, это нормально
 		} else if strings.Contains(errStr, "connection refused") {
 			atomic.AddInt64(&dc.networkErrors, 1)
-			log.Printf("[%s] Network error: %v", dc.domain, err)
 		} else if strings.Contains(errStr, "status 403") || strings.Contains(errStr, "status 401") {
-			log.Printf("[%s] Access denied on %s: %v", dc.domain, url, err)
+			// access denied
 		} else {
 			atomic.AddInt64(&dc.parseErrors, 1)
-			log.Printf("[%s] Parse error on %s: %v", dc.domain, url, err)
 		}
 		return
 	}
-	
-	// Получаем лучшую находку
-	finding := dc.detectComments(doc, finalURL)
-	
-	if finding != nil {
-		// Классифицируем с новой системой
-		tier := classifyFindingTierV2(finding, doc)
-		finding.Tier = tier
-		
-		// Фильтруем только совсем мусорные
-		if finding.Confidence < 0.1 {
-			log.Printf("[%s] Skipping very low confidence (%.2f) on %s", dc.domain, finding.Confidence, url)
-			return
+
+	siteName := extractSiteName(doc)
+
+	// Выполняем обнаружение разных типов
+	findings := make([]*Finding, 0)
+
+	// 1. Поиск комментариев (заменяет старый detectComments)
+	if commentFinding := dc.detectComments(doc, finalURL); commentFinding != nil {
+		commentFinding.Category = "comment"
+		findings = append(findings, commentFinding)
+	}
+
+	// 2. Поиск контактов
+	if contactFinding := dc.detectContactForm(doc, finalURL); contactFinding != nil {
+		contactFinding.Category = "contact"
+		findings = append(findings, contactFinding)
+	}
+
+	// 3. Поиск форумов/статей
+	if forumFinding := dc.detectForum(doc, finalURL); forumFinding != nil {
+		forumFinding.Category = "forum"
+		findings = append(findings, forumFinding)
+	}
+
+	// 4. Поиск email адресов
+	emails := extractEmails(doc)
+	if len(emails) > 0 {
+		emailFinding := &Finding{
+			Domain:    dc.domain,
+			URL:       finalURL,
+			Category:  "email",
+			SiteName:  siteName,
+			Emails:    emails,
+			Timestamp: time.Now(),
 		}
-		
-		// Для tier 4 с очень низкой confidence - логируем и пропускаем
-		if tier == 4 && finding.Confidence < 0.3 {
-			log.Printf("[%s] Skipping tier 4 with low confidence (%.2f) on %s", dc.domain, finding.Confidence, url)
-			return
-		}
-		
+		findings = append(findings, emailFinding)
+	}
+
+	for _, finding := range findings {
 		dc.results <- finding
 		atomic.AddInt64(&dc.found, 1)
-		
-		// НОВОЕ: Обучаемся на успешной находке
-		if tier <= 2 && finding.Confidence >= 0.7 {
-			dc.learnFromSuccess(finalURL)
-		}
-		
-		// Логируем находки по уровням
-		switch tier {
-		case 1:
-			log.Printf("[%s] TIER 1 found: %s (system: %s, confidence: %.2f)", 
-				dc.domain, finalURL, finding.System, finding.Confidence)
-		case 2:
-			log.Printf("[%s] Tier 2 found: %s (confidence: %.2f)", 
-				dc.domain, finalURL, finding.Confidence)
-		}
 	}
-	
+
 	// Продолжаем обход для стратегии "умри, но найди"
 	if atomic.LoadInt64(&dc.pages) < int64(dc.config.MaxPagesPerDomain) {
 		links := dc.extractLinks(doc, finalURL)
-		
+
 		// Используем улучшенную приоритизацию с извлечением дат из HTML
 		prioritized := dc.prioritizeLinksByFreshnessEnhanced(links, doc)
-		
+
 		for _, link := range prioritized {
 			if _, visited := dc.visited.Load(link); !visited {
 				select {
@@ -866,20 +892,193 @@ func (dc *DomainCrawler) processURL(url string) {
 	}
 }
 
-func (dc *DomainCrawler) fetchAndParse(url string) (*goquery.Document, string, error) {
+func extractSiteName(doc *goquery.Document) string {
+	siteName := ""
+	doc.Find("meta[property='og:site_name']").Each(func(i int, s *goquery.Selection) {
+		if content, exists := s.Attr("content"); exists {
+			siteName = content
+		}
+	})
+	if siteName == "" {
+		doc.Find("title").Each(func(i int, s *goquery.Selection) {
+			title := strings.TrimSpace(s.Text())
+			parts := strings.Split(title, "-")
+			if len(parts) > 1 {
+				siteName = strings.TrimSpace(parts[len(parts)-1])
+			} else {
+				parts = strings.Split(title, "|")
+				if len(parts) > 1 {
+					siteName = strings.TrimSpace(parts[len(parts)-1])
+				} else {
+					siteName = title
+				}
+			}
+		})
+	}
+	return siteName
+}
+
+func extractEmails(doc *goquery.Document) []string {
+	emailRegex := regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
+	text := doc.Text()
+	matches := emailRegex.FindAllString(text, -1)
+
+	// Deduplicate
+	unique := make(map[string]bool)
+	var emails []string
+	for _, email := range matches {
+		email = strings.ToLower(email)
+		// Фильтруем картинки и статику
+		if strings.HasSuffix(email, ".png") || strings.HasSuffix(email, ".jpg") || strings.HasSuffix(email, ".webp") {
+			continue
+		}
+		if !unique[email] {
+			unique[email] = true
+			emails = append(emails, email)
+		}
+	}
+	return emails
+}
+
+func (dc *DomainCrawler) detectForum(doc *goquery.Document, url string) *Finding {
+	html, _ := doc.Html()
+	htmlLower := strings.ToLower(html)
+
+	forumPatterns := []string{
+		"phpbb", "vbulletin", "xenforo", "discourse", "smf", "mybb", "ips_focus",
+		"ip.board", "invision power board", "flarum", "vanilla forums",
+	}
+
+	for _, pattern := range forumPatterns {
+		if strings.Contains(htmlLower, pattern) {
+			return &Finding{
+				Domain:     dc.domain,
+				URL:        url,
+				System:     pattern,
+				Confidence: 0.9,
+				Timestamp:  time.Now(),
+			}
+		}
+	}
+
+	// Эвристика по URL или структуре
+	if strings.Contains(strings.ToLower(url), "/forum/") || strings.Contains(strings.ToLower(url), "/board/") || strings.Contains(strings.ToLower(url), "/thread/") || strings.Contains(strings.ToLower(url), "/topic/") {
+		return &Finding{
+			Domain:     dc.domain,
+			URL:        url,
+			System:     "generic_forum",
+			Confidence: 0.7,
+			Timestamp:  time.Now(),
+		}
+	}
+
+	return nil
+}
+
+func (dc *DomainCrawler) detectContactForm(doc *goquery.Document, url string) *Finding {
+	var bestFinding *Finding
+	maxScore := 0.0
+
+	doc.Find("form").Each(func(i int, form *goquery.Selection) {
+		score := 0.0
+		signals := []string{}
+
+		fields := form.Find("input[type!='hidden'], select, textarea")
+		fieldSignatures := make(map[string]bool)
+
+		fields.Each(func(j int, field *goquery.Selection) {
+			fieldType := strings.ToLower(field.AttrOr("type", "text"))
+			name := strings.ToLower(field.AttrOr("name", ""))
+			placeholder := strings.ToLower(field.AttrOr("placeholder", ""))
+
+			combined := name + " " + placeholder
+
+			if fieldType == "tel" || strings.Contains(combined, "phone") || strings.Contains(combined, "tel") || strings.Contains(combined, "mobile") {
+				fieldSignatures["phone"] = true
+			}
+			if strings.Contains(combined, "subject") || strings.Contains(combined, "title") || strings.Contains(combined, "topic") {
+				fieldSignatures["subject"] = true
+			}
+			if strings.Contains(combined, "company") || strings.Contains(combined, "organization") || strings.Contains(combined, "business") {
+				fieldSignatures["company"] = true
+			}
+			if fieldType == "email" || strings.Contains(combined, "email") || strings.Contains(combined, "mail") {
+				fieldSignatures["email"] = true
+			}
+			if strings.Contains(combined, "name") || strings.Contains(combined, "first") || strings.Contains(combined, "last") {
+				fieldSignatures["name"] = true
+			}
+			if strings.Contains(combined, "message") || strings.Contains(combined, "inquiry") || field.Is("textarea") {
+				fieldSignatures["message"] = true
+			}
+		})
+
+		// Контактная форма обычно имеет телефон, тему, компанию или явный месседж
+		if fieldSignatures["phone"] {
+			score += 0.3
+			signals = append(signals, "has_phone")
+		}
+		if fieldSignatures["subject"] {
+			score += 0.3
+			signals = append(signals, "has_subject")
+		}
+		if fieldSignatures["company"] {
+			score += 0.3
+			signals = append(signals, "has_company")
+		}
+
+		if fieldSignatures["email"] && fieldSignatures["name"] && fieldSignatures["message"] {
+			score += 0.2
+		}
+
+		submitButtons := form.Find("button[type='submit'], input[type='submit'], button:not([type='button'])")
+		submitText := ""
+		submitButtons.Each(func(j int, btn *goquery.Selection) {
+			submitText += " " + strings.ToLower(btn.Text()+" "+btn.AttrOr("value", ""))
+		})
+
+		if strings.Contains(submitText, "contact") || strings.Contains(submitText, "send") || strings.Contains(submitText, "inquiry") || strings.Contains(submitText, "get in touch") {
+			score += 0.4
+			signals = append(signals, "contact_button")
+		}
+
+		// Отрицательные сигналы: форма комментирования
+		if strings.Contains(submitText, "comment") || strings.Contains(submitText, "reply") {
+			score -= 0.5
+		}
+
+		if score > 0.4 && score > maxScore {
+			maxScore = score
+			bestFinding = &Finding{
+				Domain:     dc.domain,
+				URL:        url,
+				System:     "contact_form",
+				Confidence: math.Min(score, 1.0),
+				Signals:    signals,
+				Timestamp:  time.Now(),
+			}
+		}
+	})
+
+	return bestFinding
+}
+
+func (dc *DomainCrawler) fetchAndParse(urlStr string) (*goquery.Document, string, error) {
 	var lastErr error
-	
+
 	for attempt := 1; attempt <= dc.config.RetryAttempts; attempt++ {
-		req, err := http.NewRequestWithContext(dc.ctx, "GET", url, nil)
+		req, err := http2.NewRequest("GET", urlStr, nil)
 		if err != nil {
 			return nil, "", err
 		}
-		
+
+		req = req.WithContext(dc.ctx)
+
 		ua := dc.config.UserAgents[rand.Intn(len(dc.config.UserAgents))]
 		req.Header.Set("User-Agent", ua)
 		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 		req.Header.Set("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
-		
+
 		resp, err := dc.client.Do(req)
 		if err != nil {
 			lastErr = err
@@ -890,16 +1089,16 @@ func (dc *DomainCrawler) fetchAndParse(url string) (*goquery.Document, string, e
 			return nil, "", err
 		}
 		defer resp.Body.Close()
-		
+
 		if resp.StatusCode >= 400 {
 			return nil, "", fmt.Errorf("status %d", resp.StatusCode)
 		}
-		
+
 		reader, err := charset.NewReader(resp.Body, resp.Header.Get("Content-Type"))
 		if err != nil {
 			reader = resp.Body
 		}
-		
+
 		body, err := io.ReadAll(io.LimitReader(reader, 10*1024*1024))
 		if err != nil {
 			lastErr = err
@@ -909,15 +1108,20 @@ func (dc *DomainCrawler) fetchAndParse(url string) (*goquery.Document, string, e
 			}
 			return nil, "", err
 		}
-		
+
 		doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 		if err != nil {
 			return nil, "", err
 		}
-		
-		return doc, resp.Request.URL.String(), nil
+
+		finalURL := urlStr
+		if resp.Request != nil && resp.Request.URL != nil {
+			finalURL = resp.Request.URL.String()
+		}
+
+		return doc, finalURL, nil
 	}
-	
+
 	return nil, "", lastErr
 }
 
@@ -925,66 +1129,66 @@ func (dc *DomainCrawler) fetchAndParse(url string) (*goquery.Document, string, e
 func (dc *DomainCrawler) detectStructuredData(doc *goquery.Document, url string) *Finding {
 	score := 0.0
 	signals := []string{}
-	
+
 	// 1. Проверяем Schema.org микроразметку
 	schemaComments := doc.Find("[itemtype*='schema.org/Comment'], [itemtype*='schema.org/UserComments']")
 	if schemaComments.Length() > 0 {
 		score += 0.9
 		signals = append(signals, "schema_org_comment")
 	}
-	
+
 	// 2. Проверяем JSON-LD структуры
 	doc.Find("script[type='application/ld+json']").Each(func(i int, s *goquery.Selection) {
 		jsonText := s.Text()
 		if strings.Contains(jsonText, "\"@type\":\"Comment\"") ||
-		   strings.Contains(jsonText, "\"@type\":\"UserComments\"") ||
-		   strings.Contains(jsonText, "\"@type\":\"DiscussionForumPosting\"") ||
-		   strings.Contains(jsonText, "\"comment\":") ||
-		   strings.Contains(jsonText, "\"commentCount\":") {
+			strings.Contains(jsonText, "\"@type\":\"UserComments\"") ||
+			strings.Contains(jsonText, "\"@type\":\"DiscussionForumPosting\"") ||
+			strings.Contains(jsonText, "\"comment\":") ||
+			strings.Contains(jsonText, "\"commentCount\":") {
 			score += 0.85
 			signals = append(signals, "json_ld_comment")
 		}
-		
+
 		// Проверяем тип статьи
 		if strings.Contains(jsonText, "\"@type\":\"Article\"") ||
-		   strings.Contains(jsonText, "\"@type\":\"BlogPosting\"") ||
-		   strings.Contains(jsonText, "\"@type\":\"NewsArticle\"") {
+			strings.Contains(jsonText, "\"@type\":\"BlogPosting\"") ||
+			strings.Contains(jsonText, "\"@type\":\"NewsArticle\"") {
 			score += 0.3
 			signals = append(signals, "article_context")
 		}
 	})
-	
+
 	// 3. Open Graph метатеги
 	doc.Find("meta[property^='og:']").Each(func(i int, s *goquery.Selection) {
 		prop, _ := s.Attr("property")
 		content, _ := s.Attr("content")
-		
+
 		if prop == "og:type" {
-			if strings.Contains(content, "article") || 
-			   strings.Contains(content, "blog") ||
-			   strings.Contains(content, "website") {
+			if strings.Contains(content, "article") ||
+				strings.Contains(content, "blog") ||
+				strings.Contains(content, "website") {
 				score += 0.2
 				signals = append(signals, "og_type_article")
 			}
 		}
 	})
-	
+
 	// 4. Микроформаты
 	if doc.Find(".h-entry, .h-card, .e-content, .p-comment").Length() > 0 {
 		score += 0.3
 		signals = append(signals, "microformats")
 	}
-	
+
 	// 5. WordPress/CMS классы
 	wpIndicators := []string{
-		".wp-comment", ".wp-comment-author", 
+		".wp-comment", ".wp-comment-author",
 		"#wp-comment-cookies-consent",
 		".comment-metadata", ".comment-awaiting-moderation",
 		".comment-edit-link", ".comment-reply-link",
 		".comments-area", ".comment-list",
 		".commentlist", ".comment-navigation",
 	}
-	
+
 	wpScore := 0.0
 	for _, indicator := range wpIndicators {
 		if doc.Find(indicator).Length() > 0 {
@@ -995,14 +1199,14 @@ func (dc *DomainCrawler) detectStructuredData(doc *goquery.Document, url string)
 		}
 	}
 	score += math.Min(wpScore, 0.6) // Максимум 0.6 от WordPress
-	
+
 	// 6. Drupal индикаторы
 	drupalIndicators := []string{
 		".comment-wrapper", ".comment-permalink",
 		".comment-submitted", ".comment-user-",
 		"#comments", ".indented",
 	}
-	
+
 	drupalScore := 0.0
 	for _, indicator := range drupalIndicators {
 		if doc.Find(indicator).Length() > 0 {
@@ -1013,7 +1217,7 @@ func (dc *DomainCrawler) detectStructuredData(doc *goquery.Document, url string)
 		}
 	}
 	score += math.Min(drupalScore, 0.4)
-	
+
 	// 7. Проверяем data-атрибуты
 	doc.Find("[data-comment], [data-comments], [data-comment-id], [data-comment-count]").Each(func(i int, s *goquery.Selection) {
 		score += 0.1
@@ -1021,7 +1225,7 @@ func (dc *DomainCrawler) detectStructuredData(doc *goquery.Document, url string)
 			signals = append(signals, "data_attributes")
 		}
 	})
-	
+
 	if score > 0.5 {
 		return &Finding{
 			Domain:     dc.domain,
@@ -1033,7 +1237,7 @@ func (dc *DomainCrawler) detectStructuredData(doc *goquery.Document, url string)
 			Timestamp:  time.Now(),
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1041,11 +1245,11 @@ func (dc *DomainCrawler) detectStructuredData(doc *goquery.Document, url string)
 func (dc *DomainCrawler) detectComments(doc *goquery.Document, url string) *Finding {
 	var bestFinding *Finding
 	maxConfidence := 0.0
-	
+
 	// Предварительный анализ контекста страницы
 	pageContext := analyzePageStructure(doc)
 	_, urlWeight := analyzeURLContext(url)
-	
+
 	// 1. Check modern comment systems (highest priority)
 	if finding := dc.detectModernSystems(doc, url); finding != nil {
 		finding.PageContext = pageContext
@@ -1055,7 +1259,7 @@ func (dc *DomainCrawler) detectComments(doc *goquery.Document, url string) *Find
 			maxConfidence = finding.Confidence
 		}
 	}
-	
+
 	// 2. Check structured data - только если не нашли modern system с высокой confidence
 	if maxConfidence < 0.9 {
 		if finding := dc.detectStructuredData(doc, url); finding != nil {
@@ -1067,7 +1271,7 @@ func (dc *DomainCrawler) detectComments(doc *goquery.Document, url string) *Find
 			}
 		}
 	}
-	
+
 	// 3. Check native forms - только если не нашли надежную систему
 	if maxConfidence < 0.8 {
 		if finding := dc.detectNativeFormsEnhanced(doc, url, pageContext, urlWeight); finding != nil {
@@ -1077,7 +1281,7 @@ func (dc *DomainCrawler) detectComments(doc *goquery.Document, url string) *Find
 			}
 		}
 	}
-	
+
 	// 4. Check AJAX/dynamic systems
 	if maxConfidence < 0.7 {
 		if finding := dc.detectDynamicSystems(doc, url); finding != nil {
@@ -1089,7 +1293,7 @@ func (dc *DomainCrawler) detectComments(doc *goquery.Document, url string) *Find
 			}
 		}
 	}
-	
+
 	// 5. Check placeholders - только как последний вариант
 	if maxConfidence < 0.5 && (pageContext > 0.2 || urlWeight > 0.1) {
 		if finding := dc.detectPlaceholdersEnhanced(doc, url, pageContext); finding != nil {
@@ -1100,7 +1304,7 @@ func (dc *DomainCrawler) detectComments(doc *goquery.Document, url string) *Find
 			}
 		}
 	}
-	
+
 	return bestFinding
 }
 
@@ -1124,7 +1328,7 @@ func (dc *DomainCrawler) detectModernSystems(doc *goquery.Document, url string) 
 			"comment-reply-link", "wp-comment", "wp-comment-",
 			"wordpress-comment", "#comments-title",
 		},
-		
+
 		// Новые и self-hosted системы
 		"commento": {
 			"#commento", ".commento", "commento.io",
@@ -1166,7 +1370,7 @@ func (dc *DomainCrawler) detectModernSystems(doc *goquery.Document, url string) 
 			".schnack-comments", "#schnack-comments",
 			"schnack.js", "data-schnack",
 		},
-		
+
 		// Региональные системы
 		"livere": {
 			"#lv-container", ".livere", "livere.com",
@@ -1180,7 +1384,7 @@ func (dc *DomainCrawler) detectModernSystems(doc *goquery.Document, url string) 
 			"ya-comments", "yandex.ru/comments",
 			"yandex-comments-widget",
 		},
-		
+
 		// CMS-специфичные
 		"drupal": {
 			"#comments", ".comment-wrapper", "drupal-comment",
@@ -1192,7 +1396,7 @@ func (dc *DomainCrawler) detectModernSystems(doc *goquery.Document, url string) 
 		"ghost": {
 			"#ghost-comments", ".ghost-comments", "data-ghost-comment",
 		},
-		
+
 		// React/Vue компоненты (по паттернам)
 		"react_comments": {
 			"data-reactroot", "__react-comment", "react-comment-",
@@ -1202,7 +1406,7 @@ func (dc *DomainCrawler) detectModernSystems(doc *goquery.Document, url string) 
 			"v-comment", "vue-comment", "comment-component",
 			"data-v-", "_comment_", "__vue__",
 		},
-		
+
 		// Другие
 		"telegram": {
 			".telegram-comments", "comments.app", "tg-comments",
@@ -1222,14 +1426,14 @@ func (dc *DomainCrawler) detectModernSystems(doc *goquery.Document, url string) 
 			"data-spot-im", "spotim_launcher",
 		},
 	}
-	
+
 	html, _ := doc.Html()
 	htmlLower := strings.ToLower(html)
-	
+
 	for system, patterns := range systems {
 		for _, pattern := range patterns {
 			if strings.Contains(htmlLower, pattern) ||
-			   doc.Find(pattern).Length() > 0 {
+				doc.Find(pattern).Length() > 0 {
 				return &Finding{
 					Domain:     dc.domain,
 					URL:        url,
@@ -1242,7 +1446,7 @@ func (dc *DomainCrawler) detectModernSystems(doc *goquery.Document, url string) 
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1250,46 +1454,46 @@ func (dc *DomainCrawler) detectModernSystems(doc *goquery.Document, url string) 
 func (dc *DomainCrawler) detectNativeFormsEnhanced(doc *goquery.Document, url string, pageContext, urlWeight float64) *Finding {
 	var bestFinding *Finding
 	maxScore := 0.0
-	
+
 	// Фиксированный базовый порог с бонусом за хороший контекст
 	minThreshold := 0.3
 	if pageContext > 0.3 || urlWeight > 0.2 {
 		// Хороший контекст СНИЖАЕТ требования, а не повышает
-		minThreshold = 0.25  
+		minThreshold = 0.25
 	}
-	
+
 	doc.Find("form").Each(func(i int, form *goquery.Selection) {
 		textareas := form.Find("textarea")
 		if textareas.Length() == 0 {
 			return
 		}
-		
+
 		// Пропускаем явные поисковые формы
 		if form.Find("input[type='search']").Length() > 0 ||
-		   form.Find("input[name='q']").Length() > 0 ||
-		   form.Find("input[name='s']").Length() > 0 {
+			form.Find("input[name='q']").Length() > 0 ||
+			form.Find("input[name='s']").Length() > 0 {
 			return
 		}
-		
+
 		// Семантический анализ формы
 		formSemantics := analyzeFormSemantics(form, doc)
-		
+
 		// Комбинированная оценка
 		score := 0.0
 		signals := []string{}
-		
+
 		// Базовая оценка от контекста
 		score += pageContext * 0.3
 		score += urlWeight * 0.2
 		score += formSemantics * 0.5
-		
+
 		// УЛУЧШЕННАЯ ЭВРИСТИКА для нестандартных имён полей
-		
+
 		// Анализ textarea - расширенный список паттернов
-		textareaPatterns := []struct{
+		textareaPatterns := []struct {
 			patterns []string
-			weight float64
-			signal string
+			weight   float64
+			signal   string
 		}{
 			{[]string{"comment", "reply", "response"}, 0.35, "textarea_comment"},
 			{[]string{"message", "msg", "text", "content", "body"}, 0.25, "textarea_message"},
@@ -1297,22 +1501,22 @@ func (dc *DomainCrawler) detectNativeFormsEnhanced(doc *goquery.Document, url st
 			{[]string{"post", "entry", "note"}, 0.15, "textarea_post"},
 			{[]string{"description", "desc", "details"}, 0.1, "textarea_description"},
 		}
-		
+
 		textareaAnalyzed := false
 		textareas.Each(func(j int, ta *goquery.Selection) {
 			if textareaAnalyzed {
 				return
 			}
-			
+
 			// Собираем все атрибуты для анализа
 			name := strings.ToLower(ta.AttrOr("name", ""))
 			id := strings.ToLower(ta.AttrOr("id", ""))
 			placeholder := strings.ToLower(ta.AttrOr("placeholder", ""))
 			className := strings.ToLower(ta.AttrOr("class", ""))
 			ariaLabel := strings.ToLower(ta.AttrOr("aria-label", ""))
-			
+
 			combined := name + " " + id + " " + placeholder + " " + className + " " + ariaLabel
-			
+
 			// Проверяем паттерны
 			for _, pattern := range textareaPatterns {
 				for _, p := range pattern.patterns {
@@ -1328,54 +1532,54 @@ func (dc *DomainCrawler) detectNativeFormsEnhanced(doc *goquery.Document, url st
 				}
 			}
 		})
-		
+
 		// Анализ других полей формы - улучшенная эвристика
 		fields := form.Find("input[type!='hidden'], select")
 		fieldSignatures := make(map[string]bool)
 		fieldTypes := make(map[string]int)
-		
+
 		fields.Each(func(j int, field *goquery.Selection) {
 			fieldType := strings.ToLower(field.AttrOr("type", "text"))
 			name := strings.ToLower(field.AttrOr("name", ""))
 			placeholder := strings.ToLower(field.AttrOr("placeholder", ""))
-			
+
 			// Создаём сигнатуру поля
 			combined := name + " " + placeholder
-			
+
 			// Классифицируем поля
 			if fieldType == "email" || strings.Contains(combined, "email") || strings.Contains(combined, "mail") {
 				fieldSignatures["email"] = true
 				fieldTypes["email"]++
 			}
-			if strings.Contains(combined, "name") || strings.Contains(combined, "author") || 
-			   strings.Contains(combined, "nick") || strings.Contains(combined, "user") {
+			if strings.Contains(combined, "name") || strings.Contains(combined, "author") ||
+				strings.Contains(combined, "nick") || strings.Contains(combined, "user") {
 				fieldSignatures["name"] = true
 				fieldTypes["name"]++
 			}
-			if fieldType == "url" || strings.Contains(combined, "website") || 
-			   strings.Contains(combined, "site") || strings.Contains(combined, "url") {
+			if fieldType == "url" || strings.Contains(combined, "website") ||
+				strings.Contains(combined, "site") || strings.Contains(combined, "url") {
 				fieldSignatures["website"] = true
 				fieldTypes["website"]++
 			}
-			if fieldType == "tel" || strings.Contains(combined, "phone") || 
-			   strings.Contains(combined, "tel") || strings.Contains(combined, "mobile") {
+			if fieldType == "tel" || strings.Contains(combined, "phone") ||
+				strings.Contains(combined, "tel") || strings.Contains(combined, "mobile") {
 				fieldSignatures["phone"] = true
 				fieldTypes["phone"]++
 			}
 			if strings.Contains(combined, "subject") || strings.Contains(combined, "title") ||
-			   strings.Contains(combined, "topic") {
+				strings.Contains(combined, "topic") {
 				fieldSignatures["subject"] = true
 				fieldTypes["subject"]++
 			}
 			if strings.Contains(combined, "company") || strings.Contains(combined, "organization") ||
-			   strings.Contains(combined, "business") {
+				strings.Contains(combined, "business") {
 				fieldSignatures["company"] = true
 				fieldTypes["company"]++
 			}
 		})
-		
+
 		// УЛУЧШЕННАЯ ЛОГИКА: Паттерны комбинаций полей
-		
+
 		// Паттерн 1: Классический комментарий (name + email + [website])
 		if fieldSignatures["name"] && fieldSignatures["email"] && !fieldSignatures["phone"] && !fieldSignatures["subject"] {
 			score += 0.35
@@ -1385,20 +1589,20 @@ func (dc *DomainCrawler) detectNativeFormsEnhanced(doc *goquery.Document, url st
 				signals = append(signals, "has_website")
 			}
 		}
-		
+
 		// Паттерн 2: Минималистичный комментарий (только email или name)
-		if (fieldSignatures["email"] || fieldSignatures["name"]) && 
-		   !fieldSignatures["phone"] && !fieldSignatures["subject"] && !fieldSignatures["company"] {
+		if (fieldSignatures["email"] || fieldSignatures["name"]) &&
+			!fieldSignatures["phone"] && !fieldSignatures["subject"] && !fieldSignatures["company"] {
 			score += 0.2
 			signals = append(signals, "minimal_comment_fields")
 		}
-		
+
 		// Паттерн 3: Анонимный комментарий (только textarea)
 		if len(fieldSignatures) == 0 && textareas.Length() == 1 {
 			score += 0.15
 			signals = append(signals, "anonymous_comment")
 		}
-		
+
 		// Негативные паттерны (контактная форма)
 		if fieldSignatures["phone"] {
 			score -= 0.4
@@ -1412,25 +1616,25 @@ func (dc *DomainCrawler) detectNativeFormsEnhanced(doc *goquery.Document, url st
 			score -= 0.3
 			signals = append(signals, "has_company")
 		}
-		
+
 		// Проверка кнопки submit - расширенный список
 		submitButtons := form.Find("button[type='submit'], input[type='submit'], button:not([type='button'])")
 		submitText := ""
 		submitButtons.Each(func(j int, btn *goquery.Selection) {
-			submitText += " " + strings.ToLower(btn.Text() + " " + btn.AttrOr("value", ""))
+			submitText += " " + strings.ToLower(btn.Text()+" "+btn.AttrOr("value", ""))
 		})
-		
-		submitPatterns := []struct{
+
+		submitPatterns := []struct {
 			patterns []string
-			weight float64
-			signal string
+			weight   float64
+			signal   string
 		}{
 			{[]string{"post comment", "add comment", "submit comment", "leave comment"}, 0.3, "button_comment"},
 			{[]string{"reply", "respond", "answer"}, 0.25, "button_reply"},
 			{[]string{"send", "submit", "post", "publish"}, 0.1, "button_generic"},
 			{[]string{"contact", "inquiry", "get in touch"}, -0.3, "button_contact"},
 		}
-		
+
 		for _, pattern := range submitPatterns {
 			for _, p := range pattern.patterns {
 				if strings.Contains(submitText, p) {
@@ -1440,13 +1644,13 @@ func (dc *DomainCrawler) detectNativeFormsEnhanced(doc *goquery.Document, url st
 				}
 			}
 		}
-		
+
 		// Проверка контекста формы
 		if form.Closest("article, .article, .post, .entry, .content-area, #content, main").Length() > 0 {
 			score += 0.15
 			signals = append(signals, "in_article")
 		}
-		
+
 		// Проверка на существующие комментарии поблизости
 		parent := form.Parent()
 		for i := 0; i < 3; i++ { // Проверяем 3 уровня вверх
@@ -1457,7 +1661,7 @@ func (dc *DomainCrawler) detectNativeFormsEnhanced(doc *goquery.Document, url st
 			}
 			parent = parent.Parent()
 		}
-		
+
 		// Проверка сложности формы
 		totalFields := fields.Length() + textareas.Length()
 		if totalFields <= 4 {
@@ -1467,7 +1671,7 @@ func (dc *DomainCrawler) detectNativeFormsEnhanced(doc *goquery.Document, url st
 			score -= 0.15
 			signals = append(signals, "complex_form")
 		}
-		
+
 		if pageContext > 0.3 {
 			signals = append(signals, "good_page_context")
 		}
@@ -1477,7 +1681,7 @@ func (dc *DomainCrawler) detectNativeFormsEnhanced(doc *goquery.Document, url st
 		if formSemantics > 0.3 {
 			signals = append(signals, "comment_form_semantics")
 		}
-		
+
 		// Финальная проверка
 		if score > minThreshold && score > maxScore {
 			maxScore = score
@@ -1497,13 +1701,13 @@ func (dc *DomainCrawler) detectNativeFormsEnhanced(doc *goquery.Document, url st
 			}
 		}
 	})
-	
+
 	return bestFinding
 }
 
 func (dc *DomainCrawler) detectDynamicSystems(doc *goquery.Document, url string) *Finding {
 	html, _ := doc.Html()
-	
+
 	ajaxPatterns := []string{
 		"loadComments", "fetchComments", "getComments",
 		"ajax.*comment", "comment.*ajax",
@@ -1511,7 +1715,7 @@ func (dc *DomainCrawler) detectDynamicSystems(doc *goquery.Document, url string)
 		"data-comments", "data-discussion-url",
 		"discussionUrl", "commentsEndpoint",
 	}
-	
+
 	for _, pattern := range ajaxPatterns {
 		re := regexp.MustCompile(`(?i)` + pattern)
 		if re.MatchString(html) {
@@ -1526,7 +1730,7 @@ func (dc *DomainCrawler) detectDynamicSystems(doc *goquery.Document, url string)
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1536,33 +1740,33 @@ func (dc *DomainCrawler) detectPlaceholdersEnhanced(doc *goquery.Document, url s
 	if pageContext < 0.1 {
 		return nil
 	}
-	
+
 	text := strings.ToLower(doc.Text())
-	
+
 	// Проверяем наличие формы или места для комментариев
 	hasCommentArea := doc.Find("form textarea, #comments, .comments, .discussion").Length() > 0
 	if !hasCommentArea {
 		return nil
 	}
-	
+
 	placeholders := map[string]float64{
-		"no comments yet":          0.5,
-		"be the first to comment":  0.5,
-		"0 comments":               0.4,
-		"leave a comment":          0.4,
-		"нет комментариев":         0.5,
-		"комментариев пока нет":    0.5,
+		"no comments yet":         0.5,
+		"be the first to comment": 0.5,
+		"0 comments":              0.4,
+		"leave a comment":         0.4,
+		"нет комментариев":        0.5,
+		"комментариев пока нет":   0.5,
 		"будьте первым":           0.4,
-		"оставить комментарий":     0.4,
-		"start the discussion":     0.5,
-		"join the conversation":    0.4,
+		"оставить комментарий":    0.4,
+		"start the discussion":    0.5,
+		"join the conversation":   0.4,
 	}
-	
+
 	for placeholder, baseConfidence := range placeholders {
 		if strings.Contains(text, placeholder) {
 			// Корректируем confidence на основе контекста
 			adjustedConfidence := baseConfidence + pageContext*0.2
-			
+
 			return &Finding{
 				Domain:      dc.domain,
 				URL:         url,
@@ -1575,34 +1779,34 @@ func (dc *DomainCrawler) detectPlaceholdersEnhanced(doc *goquery.Document, url s
 			}
 		}
 	}
-	
+
 	return nil
 }
 
 func (dc *DomainCrawler) extractLinks(doc *goquery.Document, baseURL string) []string {
 	base, _ := url.Parse(baseURL)
 	links := make(map[string]bool)
-	
+
 	doc.Find("a[href]").Each(func(i int, s *goquery.Selection) {
 		href, exists := s.Attr("href")
 		if !exists || href == "" {
 			return
 		}
-		
+
 		u, err := url.Parse(href)
 		if err != nil {
 			return
 		}
-		
+
 		absolute := base.ResolveReference(u)
-		
+
 		if absolute.Host != dc.domain && absolute.Host != "www."+dc.domain {
 			return
 		}
-		
+
 		absolute.Fragment = ""
 		absolute.RawQuery = cleanQuery(absolute.Query())
-		
+
 		path := strings.ToLower(absolute.Path)
 		skipExts := []string{
 			".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
@@ -1617,7 +1821,7 @@ func (dc *DomainCrawler) extractLinks(doc *goquery.Document, baseURL string) []s
 				return
 			}
 		}
-		
+
 		skipPaths := []string{
 			"/wp-admin", "/admin", "/cgi-bin", "/scripts",
 			"/wp-includes", "/wp-content/uploads", "/assets",
@@ -1628,15 +1832,15 @@ func (dc *DomainCrawler) extractLinks(doc *goquery.Document, baseURL string) []s
 				return
 			}
 		}
-		
+
 		links[absolute.String()] = true
 	})
-	
+
 	result := make([]string, 0, len(links))
 	for link := range links {
 		result = append(result, link)
 	}
-	
+
 	return result
 }
 
@@ -1645,53 +1849,53 @@ func (dc *DomainCrawler) prioritizeLinks(links []string) []string {
 		url   string
 		score int
 	}
-	
+
 	scored := make([]scoredLink, 0, len(links))
-	
+
 	for _, link := range links {
 		score := 50
 		lower := strings.ToLower(link)
-		
+
 		// High priority
 		if strings.Contains(lower, "comment") ||
-		   strings.Contains(lower, "discuss") ||
-		   strings.Contains(lower, "review") ||
-		   strings.Contains(lower, "forum") {
+			strings.Contains(lower, "discuss") ||
+			strings.Contains(lower, "review") ||
+			strings.Contains(lower, "forum") {
 			score += 40
 		}
-		
+
 		if strings.Contains(lower, "blog") ||
-		   strings.Contains(lower, "article") ||
-		   strings.Contains(lower, "post") ||
-		   strings.Contains(lower, "news") {
+			strings.Contains(lower, "article") ||
+			strings.Contains(lower, "post") ||
+			strings.Contains(lower, "news") {
 			score += 30
 		}
-		
+
 		if regexp.MustCompile(`/202[34]/`).MatchString(lower) {
 			score += 20
 		}
-		
+
 		// Low priority
 		if strings.Contains(lower, "contact") ||
-		   strings.Contains(lower, "about") ||
-		   strings.Contains(lower, "privacy") ||
-		   strings.Contains(lower, "terms") ||
-		   strings.Contains(lower, "login") {
+			strings.Contains(lower, "about") ||
+			strings.Contains(lower, "privacy") ||
+			strings.Contains(lower, "terms") ||
+			strings.Contains(lower, "login") {
 			score -= 20
 		}
-		
+
 		scored = append(scored, scoredLink{url: link, score: score})
 	}
-	
+
 	sort.Slice(scored, func(i, j int) bool {
 		return scored[i].score > scored[j].score
 	})
-	
+
 	result := make([]string, len(scored))
 	for i, sl := range scored {
 		result[i] = sl.url
 	}
-	
+
 	return result
 }
 
@@ -1700,18 +1904,18 @@ func extractDateFromPage(doc *goquery.Document) (year int, month int, confidence
 	currentYear := time.Now().Year()
 	year, month = 0, 0
 	confidence = 0.0
-	
+
 	// 1. Проверяем meta теги (самый надежный источник)
 	doc.Find("meta").Each(func(i int, s *goquery.Selection) {
 		property, _ := s.Attr("property")
 		name, _ := s.Attr("name")
 		content, _ := s.Attr("content")
-		
+
 		// Open Graph и Schema.org даты
-		if property == "article:published_time" || 
-		   property == "article:modified_time" ||
-		   name == "publish_date" ||
-		   name == "date" {
+		if property == "article:published_time" ||
+			property == "article:modified_time" ||
+			name == "publish_date" ||
+			name == "date" {
 			if t, err := time.Parse(time.RFC3339, content); err == nil {
 				year = t.Year()
 				month = int(t.Month())
@@ -1727,18 +1931,18 @@ func extractDateFromPage(doc *goquery.Document) (year int, month int, confidence
 			}
 		}
 	})
-	
+
 	if confidence > 0 {
 		return
 	}
-	
+
 	// 2. Проверяем time элементы
 	doc.Find("time[datetime]").Each(func(i int, s *goquery.Selection) {
 		datetime, exists := s.Attr("datetime")
 		if !exists {
 			return
 		}
-		
+
 		if t, err := time.Parse(time.RFC3339, datetime); err == nil {
 			year = t.Year()
 			month = int(t.Month())
@@ -1752,11 +1956,11 @@ func extractDateFromPage(doc *goquery.Document) (year int, month int, confidence
 			return
 		}
 	})
-	
+
 	if confidence > 0 {
 		return
 	}
-	
+
 	// 3. Ищем даты в тексте (менее надежно)
 	datePatterns := []struct {
 		regex *regexp.Regexp
@@ -1766,7 +1970,7 @@ func extractDateFromPage(doc *goquery.Document) (year int, month int, confidence
 		{regexp.MustCompile(`(\d{1,2})/(\d{1,2})/(\d{4})`), 0.5},
 		{regexp.MustCompile(`(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+(\d{4})`), 0.5},
 	}
-	
+
 	doc.Find(".date, .post-date, .entry-date, .published, .timestamp").Each(func(i int, s *goquery.Selection) {
 		text := s.Text()
 		for _, p := range datePatterns {
@@ -1782,7 +1986,7 @@ func extractDateFromPage(doc *goquery.Document) (year int, month int, confidence
 			}
 		}
 	})
-	
+
 	return
 }
 
@@ -1792,7 +1996,7 @@ func extractURLPattern(urlStr string) string {
 	if err != nil {
 		return ""
 	}
-	
+
 	path := u.Path
 	// Заменяем числа на плейсхолдеры для обобщения паттерна
 	// /2024/12/article-name -> /{year}/{month}/article-name
@@ -1800,7 +2004,7 @@ func extractURLPattern(urlStr string) string {
 	path = regexp.MustCompile(`/\d{1,2}/`).ReplaceAllString(path, "/{num}/")
 	path = regexp.MustCompile(`-\d+`).ReplaceAllString(path, "-{id}")
 	path = regexp.MustCompile(`/\d+$`).ReplaceAllString(path, "/{id}")
-	
+
 	return path
 }
 
@@ -1810,17 +2014,17 @@ func (dc *DomainCrawler) learnFromSuccess(url string) {
 	if pattern == "" {
 		return
 	}
-	
+
 	// Увеличиваем счетчик для этого паттерна
 	if count, ok := dc.patternCounts.Load(pattern); ok {
 		dc.patternCounts.Store(pattern, count.(int)+1)
 	} else {
 		dc.patternCounts.Store(pattern, 1)
 	}
-	
+
 	// Запоминаем URL как успешный
 	dc.successPatterns.Store(url, true)
-	
+
 	log.Printf("[%s] Learned pattern: %s (count: %d)", dc.domain, pattern, dc.getPatternCount(pattern))
 }
 
@@ -1838,9 +2042,9 @@ func (dc *DomainCrawler) scoreByPattern(url string) int {
 	if pattern == "" {
 		return 0
 	}
-	
+
 	count := dc.getPatternCount(pattern)
-	
+
 	// Чем чаще находили комментарии по этому паттерну, тем выше приоритет
 	switch {
 	case count >= 10:
@@ -1859,36 +2063,36 @@ func (dc *DomainCrawler) scoreByPattern(url string) int {
 // prioritizeLinksByFreshnessEnhanced - улучшенная приоритизация с извлечением дат из контента
 func (dc *DomainCrawler) prioritizeLinksByFreshnessEnhanced(links []string, currentDoc *goquery.Document) []string {
 	type scoredLink struct {
-		url           string
-		score         int
-		year          int
-		month         int
-		confidence    float64
-		patternScore  int  // NEW: оценка на основе успешных паттернов
+		url          string
+		score        int
+		year         int
+		month        int
+		confidence   float64
+		patternScore int // NEW: оценка на основе успешных паттернов
 	}
-	
+
 	scored := make([]scoredLink, 0, len(links))
 	currentYear := time.Now().Year()
 	currentMonth := int(time.Now().Month())
-	
+
 	// Регулярные выражения для дат в URL
 	yearMonthRegex := regexp.MustCompile(`/(\d{4})/(\d{1,2})/`)
 	yearOnlyRegex := regexp.MustCompile(`/(\d{4})/`)
-	
+
 	// Если можем, извлекаем дату текущей страницы для контекста
 	pageYear, _, _ := extractDateFromPage(currentDoc)
-	
+
 	// Считаем сколько успешных находок уже было
 	foundCount := atomic.LoadInt64(&dc.found)
-	
+
 	for _, link := range links {
 		sl := scoredLink{url: link, score: 50}
 		lower := strings.ToLower(link)
-		
+
 		// НОВОЕ: Оцениваем на основе изученных паттернов
 		sl.patternScore = dc.scoreByPattern(link)
 		sl.score += sl.patternScore
-		
+
 		// Извлекаем дату из URL
 		if matches := yearMonthRegex.FindStringSubmatch(link); len(matches) > 2 {
 			sl.year, _ = strconv.Atoi(matches[1])
@@ -1898,11 +2102,11 @@ func (dc *DomainCrawler) prioritizeLinksByFreshnessEnhanced(links []string, curr
 			sl.year, _ = strconv.Atoi(matches[1])
 			sl.confidence = 0.5
 		}
-		
+
 		// Оцениваем свежесть (не исключаем старые!)
 		if sl.year > 0 {
 			yearDiff := currentYear - sl.year
-			
+
 			switch {
 			case yearDiff == 0: // Текущий год
 				sl.score += 100
@@ -1927,31 +2131,31 @@ func (dc *DomainCrawler) prioritizeLinksByFreshnessEnhanced(links []string, curr
 				sl.score += 30
 			}
 		}
-		
+
 		// Дополнительные индикаторы
 		if strings.Contains(lower, "comment") || strings.Contains(lower, "discuss") {
 			sl.score += 30
 		}
-		if strings.Contains(lower, "blog") || strings.Contains(lower, "article") || 
-		   strings.Contains(lower, "post") || strings.Contains(lower, "news") {
+		if strings.Contains(lower, "blog") || strings.Contains(lower, "article") ||
+			strings.Contains(lower, "post") || strings.Contains(lower, "news") {
 			sl.score += 20
 		}
-		
+
 		// После первых 20 находок снижаем штраф для агрегаторов
 		// (может там тоже есть комментарии)
 		penaltyReduction := 0
 		if foundCount > 20 {
 			penaltyReduction = 10
 		}
-		
+
 		if strings.Contains(lower, "/page/") || strings.Contains(lower, "/tag/") ||
-		   strings.Contains(lower, "/category/") || strings.Contains(lower, "/archive/") {
+			strings.Contains(lower, "/category/") || strings.Contains(lower, "/archive/") {
 			sl.score -= (30 - penaltyReduction) // Адаптивный штраф
 		}
-		
+
 		scored = append(scored, sl)
 	}
-	
+
 	// Сортируем по score, потом по паттерну, потом по дате
 	sort.Slice(scored, func(i, j int) bool {
 		if scored[i].score != scored[j].score {
@@ -1965,21 +2169,21 @@ func (dc *DomainCrawler) prioritizeLinksByFreshnessEnhanced(links []string, curr
 		}
 		return scored[i].month > scored[j].month
 	})
-	
+
 	// Логируем топ-5 для отладки (только если нашли что-то интересное)
 	if len(scored) > 0 && scored[0].patternScore > 0 {
 		log.Printf("[%s] Top prioritized URLs (pattern learning active):", dc.domain)
 		for i := 0; i < 5 && i < len(scored); i++ {
-			log.Printf("  [%d] Score:%d Pattern:%d Year:%d URL:%s", 
+			log.Printf("  [%d] Score:%d Pattern:%d Year:%d URL:%s",
 				i+1, scored[i].score, scored[i].patternScore, scored[i].year, scored[i].url)
 		}
 	}
-	
+
 	result := make([]string, len(scored))
 	for i, sl := range scored {
 		result[i] = sl.url
 	}
-	
+
 	return result
 }
 
@@ -1987,45 +2191,47 @@ func (dc *DomainCrawler) processSitemap() {
 	// Пробуем несколько вариантов sitemap
 	sitemapURLs := []string{
 		"https://" + dc.domain + "/sitemap.xml",
-		"https://" + dc.domain + "/sitemap_index.xml", 
+		"https://" + dc.domain + "/sitemap_index.xml",
 		"https://" + dc.domain + "/sitemap1.xml",
 		"https://" + dc.domain + "/post-sitemap.xml",
 		"https://" + dc.domain + "/page-sitemap.xml",
 		"http://" + dc.domain + "/sitemap.xml",
 	}
-	
+
 	allLinks := make([]string, 0, 1000)
-	
+
 	for _, sitemapURL := range sitemapURLs {
-		req, err := http.NewRequestWithContext(dc.ctx, "GET", sitemapURL, nil)
+		req, err := http2.NewRequest("GET", sitemapURL, nil)
 		if err != nil {
 			continue
 		}
-		
+
+		req = req.WithContext(dc.ctx)
+
 		ua := dc.config.UserAgents[rand.Intn(len(dc.config.UserAgents))]
 		req.Header.Set("User-Agent", ua)
-		
+
 		resp, err := dc.client.Do(req)
 		if err != nil {
 			continue
 		}
 		defer resp.Body.Close()
-		
+
 		if resp.StatusCode != 200 {
 			continue
 		}
-		
+
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024)) // Увеличил до 5MB
 		if err != nil {
 			continue
 		}
-		
+
 		// Парсим sitemap
 		if strings.Contains(string(body), "<sitemapindex") {
 			// Это индексный файл - извлекаем вложенные sitemap
 			re := regexp.MustCompile(`<loc>([^<]+)</loc>`)
 			matches := re.FindAllSubmatch(body, -1)
-			
+
 			for _, match := range matches {
 				if len(match) > 1 {
 					nestedURL := string(match[1])
@@ -2037,15 +2243,15 @@ func (dc *DomainCrawler) processSitemap() {
 			// Обычный sitemap
 			dc.extractLinksFromSitemap(body, &allLinks)
 		}
-		
+
 		if len(allLinks) > 100 {
 			break // Достаточно ссылок
 		}
 	}
-	
+
 	// Также проверяем robots.txt для поиска sitemap
 	dc.processRobotsTxt(&allLinks)
-	
+
 	// Приоритизируем и добавляем в очередь
 	if len(allLinks) > 0 {
 		prioritized := dc.prioritizeLinks(allLinks)
@@ -2053,7 +2259,7 @@ func (dc *DomainCrawler) processSitemap() {
 		if len(prioritized) < maxToAdd {
 			maxToAdd = len(prioritized)
 		}
-		
+
 		for i := 0; i < maxToAdd; i++ {
 			select {
 			case dc.queue <- prioritized[i]:
@@ -2064,29 +2270,31 @@ func (dc *DomainCrawler) processSitemap() {
 }
 
 func (dc *DomainCrawler) processSitemapURL(sitemapURL string, allLinks *[]string) {
-	req, err := http.NewRequestWithContext(dc.ctx, "GET", sitemapURL, nil)
+	req, err := http2.NewRequest("GET", sitemapURL, nil)
 	if err != nil {
 		return
 	}
-	
+
+	req = req.WithContext(dc.ctx)
+
 	ua := dc.config.UserAgents[rand.Intn(len(dc.config.UserAgents))]
 	req.Header.Set("User-Agent", ua)
-	
+
 	resp, err := dc.client.Do(req)
 	if err != nil {
 		return
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != 200 {
 		return
 	}
-	
+
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 	if err != nil {
 		return
 	}
-	
+
 	dc.extractLinksFromSitemap(body, allLinks)
 }
 
@@ -2094,15 +2302,15 @@ func (dc *DomainCrawler) extractLinksFromSitemap(body []byte, allLinks *[]string
 	// Извлекаем URL с приоритетами и датами
 	re := regexp.MustCompile(`<url>.*?<loc>([^<]+)</loc>.*?(?:<lastmod>([^<]+)</lastmod>)?.*?(?:<priority>([^<]+)</priority>)?.*?</url>`)
 	matches := re.FindAllSubmatch(body, -1)
-	
+
 	type urlInfo struct {
 		url      string
 		lastmod  string
 		priority float64
 	}
-	
+
 	urls := make([]urlInfo, 0, len(matches))
-	
+
 	for _, match := range matches {
 		if len(match) > 1 {
 			info := urlInfo{
@@ -2110,21 +2318,21 @@ func (dc *DomainCrawler) extractLinksFromSitemap(body []byte, allLinks *[]string
 				lastmod:  "",
 				priority: 0.5,
 			}
-			
+
 			if len(match) > 2 && match[2] != nil {
 				info.lastmod = string(match[2])
 			}
-			
+
 			if len(match) > 3 && match[3] != nil {
 				if p, err := strconv.ParseFloat(string(match[3]), 64); err == nil {
 					info.priority = p
 				}
 			}
-			
+
 			urls = append(urls, info)
 		}
 	}
-	
+
 	// Сортируем по приоритету и дате
 	sort.Slice(urls, func(i, j int) bool {
 		// Сначала по приоритету
@@ -2134,7 +2342,7 @@ func (dc *DomainCrawler) extractLinksFromSitemap(body []byte, allLinks *[]string
 		// Потом по дате (новые первыми)
 		return urls[i].lastmod > urls[j].lastmod
 	})
-	
+
 	// Добавляем в список
 	for _, info := range urls {
 		*allLinks = append(*allLinks, info.url)
@@ -2143,30 +2351,32 @@ func (dc *DomainCrawler) extractLinksFromSitemap(body []byte, allLinks *[]string
 
 func (dc *DomainCrawler) processRobotsTxt(allLinks *[]string) {
 	robotsURL := "https://" + dc.domain + "/robots.txt"
-	
-	req, err := http.NewRequestWithContext(dc.ctx, "GET", robotsURL, nil)
+
+	req, err := http2.NewRequest("GET", robotsURL, nil)
 	if err != nil {
 		return
 	}
-	
+
+	req = req.WithContext(dc.ctx)
+
 	ua := dc.config.UserAgents[rand.Intn(len(dc.config.UserAgents))]
 	req.Header.Set("User-Agent", ua)
-	
+
 	resp, err := dc.client.Do(req)
 	if err != nil {
 		return
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != 200 {
 		return
 	}
-	
+
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 100*1024))
 	if err != nil {
 		return
 	}
-	
+
 	// Ищем sitemap в robots.txt
 	lines := strings.Split(string(body), "\n")
 	for _, line := range lines {
@@ -2176,17 +2386,17 @@ func (dc *DomainCrawler) processRobotsTxt(allLinks *[]string) {
 			dc.processSitemapURL(sitemapURL, allLinks)
 		}
 	}
-	
+
 	// Также анализируем разрешённые пути
 	userAgentBlock := false
 	for _, line := range lines {
 		line = strings.TrimSpace(strings.ToLower(line))
-		
+
 		if strings.HasPrefix(line, "user-agent:") {
 			ua := strings.TrimSpace(line[11:])
 			userAgentBlock = (ua == "*" || strings.Contains(ua, "bot"))
 		}
-		
+
 		if userAgentBlock && strings.HasPrefix(line, "allow:") {
 			path := strings.TrimSpace(line[6:])
 			if path != "/" && path != "" {
@@ -2200,25 +2410,25 @@ func (dc *DomainCrawler) processRobotsTxt(allLinks *[]string) {
 
 func (dc *DomainCrawler) monitor() {
 	defer dc.wg.Done()
-	
+
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	
+
 	emptyQueueCount := 0
-	
+
 	for {
 		select {
 		case <-dc.ctx.Done():
 			return
-			
+
 		case <-ticker.C:
 			pages := atomic.LoadInt64(&dc.pages)
 			found := atomic.LoadInt64(&dc.found)
 			queueLen := len(dc.queue)
-			
+
 			if queueLen == 0 {
 				emptyQueueCount++
-				
+
 				if emptyQueueCount >= 3 {
 					if pages >= 50 || found > 0 {
 						log.Printf("[%s] Completed: %d pages, %d with comments", dc.domain, pages, found)
@@ -2233,7 +2443,7 @@ func (dc *DomainCrawler) monitor() {
 			} else {
 				emptyQueueCount = 0
 			}
-			
+
 			if pages >= int64(dc.config.MaxPagesPerDomain) {
 				log.Printf("[%s] Reached max pages limit (%d)", dc.domain, pages)
 				dc.cancel()
@@ -2249,8 +2459,8 @@ func (dc *DomainCrawler) Wait() {
 
 func (dc *DomainCrawler) Stats() (pages, found, errors int64) {
 	return atomic.LoadInt64(&dc.pages),
-	       atomic.LoadInt64(&dc.found),
-	       atomic.LoadInt64(&dc.errors)
+		atomic.LoadInt64(&dc.found),
+		atomic.LoadInt64(&dc.errors)
 }
 
 // ============================================================================
@@ -2259,33 +2469,48 @@ func (dc *DomainCrawler) Stats() (pages, found, errors int64) {
 
 func NewMainCrawler(config *Config) (*MainCrawler, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	
-	outputFile, err := os.OpenFile(config.OutputFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+
+	commentsFile, err := os.OpenFile("1_comments.jsonl", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		cancel()
 		return nil, err
 	}
-	
-	tier1File, _ := os.Create("tier1_definite_comments.txt")
-	tier2File, _ := os.Create("tier2_probable_comments.txt")
-	tier3File, _ := os.Create("tier3_possible_comments.txt")
-	tier4File, _ := os.Create("tier4_ambiguous.txt")
-	
-	crawler := &MainCrawler{
-		config:     config,
-		results:    make(chan *Finding, 1000),
-		outputFile: outputFile,
-		tier1File:  tier1File,
-		tier2File:  tier2File,
-		tier3File:  tier3File,
-		tier4File:  tier4File,
-		ctx:        ctx,
-		cancel:     cancel,
-		startTime:  time.Now(),
+
+	emailsFile, err := os.OpenFile("2_emails.jsonl", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
 	}
-	
+
+	forumsFile, err := os.OpenFile("3_forums.jsonl", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	contactsFile, err := os.OpenFile("4_contacts.jsonl", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	errorsFile, err := os.OpenFile("5_errors.jsonl", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	crawler := &MainCrawler{
+		config:         config,
+		results:        make(chan *Finding, 1000),
+		commentsFile:   commentsFile,
+		emailsFile:     emailsFile,
+		forumsFile:     forumsFile,
+		contactsFile:   contactsFile,
+		errorsFile:     errorsFile,
+		categoryCounts: make(map[string]int64),
+		ctx:            ctx,
+		cancel:         cancel,
+		startTime:      time.Now(),
+	}
+
 	crawler.loadCheckpoint()
-	
+
 	return crawler, nil
 }
 
@@ -2298,7 +2523,7 @@ func (mc *MainCrawler) loadCheckpoint() {
 		}
 		return
 	}
-	
+
 	var cp Checkpoint
 	if err := json.Unmarshal(data, &cp); err != nil {
 		mc.checkpoint = &Checkpoint{
@@ -2307,20 +2532,20 @@ func (mc *MainCrawler) loadCheckpoint() {
 		}
 		return
 	}
-	
+
 	mc.checkpoint = &cp
 }
 
 func (mc *MainCrawler) saveCheckpoint() {
 	mc.checkpointMu.Lock()
 	defer mc.checkpointMu.Unlock()
-	
+
 	mc.checkpoint.Timestamp = time.Now()
 	mc.checkpoint.Statistics["domains_done"] = atomic.LoadInt64(&mc.domainsDone)
 	mc.checkpoint.Statistics["domains_with_comments"] = atomic.LoadInt64(&mc.domainsWithComments)
 	mc.checkpoint.Statistics["pages_total"] = atomic.LoadInt64(&mc.pagesTotal)
 	mc.checkpoint.Statistics["pages_with_comments"] = atomic.LoadInt64(&mc.findingsTotal)
-	
+
 	data, _ := json.MarshalIndent(mc.checkpoint, "", "  ")
 	os.WriteFile(mc.config.CheckpointFile, data, 0644)
 }
@@ -2330,50 +2555,50 @@ func (mc *MainCrawler) Run(domainFile string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	mc.domains = domains
 	atomic.StoreInt64(&mc.domainsTotal, int64(len(domains)))
-	
-	log.Printf("Starting: %d domains | Workers: %d per domain | Timeout: %s", 
+
+	log.Printf("Starting: %d domains | Workers: %d per domain | Timeout: %s",
 		len(domains), mc.config.WorkersPerDomain, mc.config.RequestTimeout)
-	
+
 	mc.wg.Add(1)
 	go mc.processResults()
-	
+
 	mc.wg.Add(1)
 	go mc.checkpointRoutine()
-	
+
 	mc.wg.Add(1)
 	go mc.progressReporter()
-	
+
 	semaphore := make(chan struct{}, mc.config.MaxTotalWorkers/mc.config.WorkersPerDomain)
-	
+
 	for _, domain := range domains {
 		mc.checkpointMu.RLock()
 		processed := mc.checkpoint.ProcessedDomains[domain]
 		mc.checkpointMu.RUnlock()
-		
+
 		if processed {
 			atomic.AddInt64(&mc.domainsDone, 1)
 			continue
 		}
-		
+
 		semaphore <- struct{}{}
 		mc.wg.Add(1)
-		
+
 		go func(d string) {
 			defer mc.wg.Done()
 			defer func() { <-semaphore }()
-			
+
 			mc.processDomain(d)
 		}(domain)
 	}
-	
+
 	mc.wg.Wait()
-	
+
 	mc.saveCheckpoint()
 	mc.printFinalStats()
-	
+
 	return nil
 }
 
@@ -2381,24 +2606,24 @@ func (mc *MainCrawler) processDomain(domain string) {
 	atomic.AddInt64(&mc.domainsActive, 1)
 	defer atomic.AddInt64(&mc.domainsActive, -1)
 	defer atomic.AddInt64(&mc.domainsDone, 1)
-	
+
 	dc := NewDomainCrawler(domain, mc.config, mc.results)
 	mc.domainCrawlers.Store(domain, dc)
 	defer mc.domainCrawlers.Delete(domain)
-	
+
 	dc.Start()
 	dc.Wait()
-	
+
 	pages, found, errors := dc.Stats()
 	atomic.AddInt64(&mc.pagesTotal, pages)
 	atomic.AddInt64(&mc.errorsTotal, errors)
-	
+
 	if found > 0 {
 		atomic.AddInt64(&mc.findingsTotal, found)
 		atomic.AddInt64(&mc.domainsWithComments, 1)
 		log.Printf("[%s] Completed: %d pages, %d pages with comments", domain, pages, found)
 	}
-	
+
 	mc.checkpointMu.Lock()
 	mc.checkpoint.ProcessedDomains[domain] = true
 	mc.checkpointMu.Unlock()
@@ -2406,104 +2631,74 @@ func (mc *MainCrawler) processDomain(domain string) {
 
 func (mc *MainCrawler) processResults() {
 	defer mc.wg.Done()
-	defer mc.tier1File.Close()
-	defer mc.tier2File.Close()
-	defer mc.tier3File.Close()
-	defer mc.tier4File.Close()
-	
-	encoder := json.NewEncoder(mc.outputFile)
+	defer mc.commentsFile.Close()
+	defer mc.emailsFile.Close()
+	defer mc.forumsFile.Close()
+	defer mc.contactsFile.Close()
+	defer mc.errorsFile.Close()
+
 	uniqueURLs := make(map[string]bool)
-	
-	txtFile, err := os.Create("urls_with_comments.txt")
-	if err == nil {
-		defer txtFile.Close()
-	}
-	
+
 	for {
 		select {
 		case finding := <-mc.results:
 			if finding == nil {
 				continue
 			}
-			
-			if uniqueURLs[finding.URL] {
+
+			uniqueKey := finding.URL + "_" + finding.Category
+			if uniqueURLs[uniqueKey] {
 				continue
 			}
-			uniqueURLs[finding.URL] = true
-			
-			// Tier уже установлен в processURL
-			tier := finding.Tier
-			if tier < 1 || tier > 4 {
-				tier = 4
-			}
-			
-			atomic.AddInt64(&mc.tierCounts[tier], 1)
-			
-			line := finding.URL + "\n"
-			
-			switch tier {
-			case 1:
-				mc.tier1File.WriteString(line)
-			case 2:
-				mc.tier2File.WriteString(line)
-			case 3:
-				mc.tier3File.WriteString(line)
-			case 4:
-				mc.tier4File.WriteString(line)
-			}
-			
-			if txtFile != nil && tier <= 3 {
-				txtFile.WriteString(line)
-			}
-			
+			uniqueURLs[uniqueKey] = true
+
 			mc.outputMu.Lock()
-			encoder.Encode(finding)
+			mc.categoryCounts[finding.Category]++
+
+			data, _ := json.Marshal(finding)
+			data = append(data, '\n')
+
+			switch finding.Category {
+			case "comment":
+				mc.commentsFile.Write(data)
+			case "email":
+				mc.emailsFile.Write(data)
+			case "forum":
+				mc.forumsFile.Write(data)
+			case "contact":
+				mc.contactsFile.Write(data)
+			case "error":
+				mc.errorsFile.Write(data)
+			}
 			mc.outputMu.Unlock()
-			
+
 		case <-mc.ctx.Done():
 			for len(mc.results) > 0 {
 				finding := <-mc.results
-				if finding != nil && !uniqueURLs[finding.URL] {
-					uniqueURLs[finding.URL] = true
-					tier := finding.Tier
-					
-					if tier < 1 || tier > 4 {
-						tier = 4
+				if finding == nil {
+					continue
+				}
+				uniqueKey := finding.URL + "_" + finding.Category
+				if !uniqueURLs[uniqueKey] {
+					uniqueURLs[uniqueKey] = true
+					data, _ := json.Marshal(finding)
+					data = append(data, '\n')
+
+					switch finding.Category {
+					case "comment":
+						mc.commentsFile.Write(data)
+					case "email":
+						mc.emailsFile.Write(data)
+					case "forum":
+						mc.forumsFile.Write(data)
+					case "contact":
+						mc.contactsFile.Write(data)
+					case "error":
+						mc.errorsFile.Write(data)
 					}
-					
-					atomic.AddInt64(&mc.tierCounts[tier], 1)
-					
-					line := finding.URL + "\n"
-					switch tier {
-					case 1:
-						mc.tier1File.WriteString(line)
-					case 2:
-						mc.tier2File.WriteString(line)
-					case 3:
-						mc.tier3File.WriteString(line)
-					case 4:
-						mc.tier4File.WriteString(line)
-					}
-					
-					if txtFile != nil && tier <= 3 {
-						txtFile.WriteString(line)
-					}
-					
-					encoder.Encode(finding)
 				}
 			}
-			
-			log.Println("\n" + strings.Repeat("=", 60))
-			log.Println("TIER DISTRIBUTION:")
-			log.Printf("  Tier 1 (definite):  %d URLs", atomic.LoadInt64(&mc.tierCounts[1]))
-			log.Printf("  Tier 2 (probable):  %d URLs", atomic.LoadInt64(&mc.tierCounts[2]))
-			log.Printf("  Tier 3 (possible):  %d URLs", atomic.LoadInt64(&mc.tierCounts[3]))
-			log.Printf("  Tier 4 (ambiguous): %d URLs", atomic.LoadInt64(&mc.tierCounts[4]))
-			total := atomic.LoadInt64(&mc.tierCounts[1]) + atomic.LoadInt64(&mc.tierCounts[2]) +
-			        atomic.LoadInt64(&mc.tierCounts[3]) + atomic.LoadInt64(&mc.tierCounts[4])
-			log.Printf("  Total classified:   %d URLs", total)
-			log.Println(strings.Repeat("=", 60))
-			
+
 			return
 		}
 	}
@@ -2511,10 +2706,10 @@ func (mc *MainCrawler) processResults() {
 
 func (mc *MainCrawler) checkpointRoutine() {
 	defer mc.wg.Done()
-	
+
 	ticker := time.NewTicker(mc.config.CheckpointInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ticker.C:
@@ -2527,10 +2722,10 @@ func (mc *MainCrawler) checkpointRoutine() {
 
 func (mc *MainCrawler) progressReporter() {
 	defer mc.wg.Done()
-	
+
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ticker.C:
@@ -2549,24 +2744,16 @@ func (mc *MainCrawler) printStats() {
 	pagesTotal := atomic.LoadInt64(&mc.pagesTotal)
 	findingsTotal := atomic.LoadInt64(&mc.findingsTotal)
 	errorsTotal := atomic.LoadInt64(&mc.errorsTotal)
-	
+
 	pagesPerSec := float64(pagesTotal) / elapsed.Seconds()
 	domainsProgress := float64(domainsDone) * 100 / float64(domainsTotal)
-	
-	tier1 := atomic.LoadInt64(&mc.tierCounts[1])
-	tier2 := atomic.LoadInt64(&mc.tierCounts[2])
-	tierStr := ""
-	if tier1 > 0 || tier2 > 0 {
-		tierStr = fmt.Sprintf(" | T1:%d T2:%d", tier1, tier2)
-	}
-	
-	log.Printf("[%.1f%%] Active: %d | Done: %d/%d | Pages: %d (%.1f/s) | Pages with comments: %d%s | Errors: %d",
+
+	log.Printf("[%.1f%%] Active: %d | Done: %d/%d | Pages: %d (%.1f/s) | Findings: %d | Errors: %d",
 		domainsProgress,
 		domainsActive,
 		domainsDone, domainsTotal,
 		pagesTotal, pagesPerSec,
 		findingsTotal,
-		tierStr,
 		errorsTotal,
 	)
 }
@@ -2579,67 +2766,84 @@ func (mc *MainCrawler) printFinalStats() {
 	domainsWithComments := atomic.LoadInt64(&mc.domainsWithComments)
 	pagesWithComments := atomic.LoadInt64(&mc.findingsTotal)
 	errorsTotal := atomic.LoadInt64(&mc.errorsTotal)
-	
+
 	successRate := float64(domainsWithComments) * 100 / maxFloat(1, float64(domainsDone))
-	
+
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Printf("FINAL RESULTS\n")
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Printf("Runtime: %s\n", elapsed.Truncate(time.Second))
 	fmt.Printf("Domains processed: %d/%d\n", domainsDone, domainsTotal)
 	fmt.Printf("Total pages crawled: %d\n", pagesTotal)
-	fmt.Printf("Domains with comments: %d (%.1f%%)\n", domainsWithComments, successRate)
-	fmt.Printf("Pages with comments: %d\n", pagesWithComments)
+	fmt.Printf("Domains with finds: %d (%.1f%%)\n", domainsWithComments, successRate)
+	fmt.Printf("Pages with finds: %d\n", pagesWithComments)
 	fmt.Printf("Total errors: %d\n", errorsTotal)
-	fmt.Printf("Output files:\n")
-	fmt.Printf("  - %s (JSON with all data)\n", mc.config.OutputFile)
-	fmt.Printf("  - tier1_definite_comments.txt\n")
-	fmt.Printf("  - tier2_probable_comments.txt\n")
-	fmt.Printf("  - tier3_possible_comments.txt\n")
-	fmt.Printf("  - tier4_ambiguous.txt\n")
+
+	mc.outputMu.Lock()
+	fmt.Println("\nDISTRIBUTION:")
+	for category, count := range mc.categoryCounts {
+		fmt.Printf("  %s: %d\n", category, count)
+	}
+	mc.outputMu.Unlock()
+
+	fmt.Printf("\nOutput files:\n")
+	fmt.Printf("  - 1_comments.jsonl\n")
+	fmt.Printf("  - 2_emails.jsonl\n")
+	fmt.Printf("  - 3_forums.jsonl\n")
+	fmt.Printf("  - 4_contacts.jsonl\n")
+	fmt.Printf("  - 5_errors.jsonl\n")
 	fmt.Println(strings.Repeat("=", 60))
 }
 
 func (mc *MainCrawler) loadDomains(path string) ([]string, error) {
+	domains, err := loadLines(path)
+	if err != nil {
+		return nil, err
+	}
+	var processed []string
+	for _, domain := range domains {
+		domain = strings.TrimPrefix(domain, "http://")
+		domain = strings.TrimPrefix(domain, "https://")
+		domain = strings.TrimPrefix(domain, "www.")
+		domain = strings.TrimSuffix(domain, "/")
+		processed = append(processed, strings.ToLower(domain))
+	}
+	return processed, nil
+}
+
+func loadLines(path string) ([]string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	
-	var domains []string
+
+	var lines []string
 	scanner := bufio.NewScanner(file)
-	
+
 	for scanner.Scan() {
-		domain := strings.TrimSpace(scanner.Text())
-		if domain == "" || strings.HasPrefix(domain, "#") {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		
-		domain = strings.TrimPrefix(domain, "http://")
-		domain = strings.TrimPrefix(domain, "https://")
-		domain = strings.TrimPrefix(domain, "www.")
-		domain = strings.TrimSuffix(domain, "/")
-		
-		domains = append(domains, strings.ToLower(domain))
+		lines = append(lines, line)
 	}
-	
-	return domains, scanner.Err()
+
+	return lines, scanner.Err()
 }
 
 func (mc *MainCrawler) Shutdown() {
 	log.Println("Shutting down...")
 	mc.cancel()
-	
+
 	mc.domainCrawlers.Range(func(key, value interface{}) bool {
 		if dc, ok := value.(*DomainCrawler); ok {
 			dc.cancel()
 		}
 		return true
 	})
-	
+
 	mc.wg.Wait()
-	mc.outputFile.Close()
 	mc.saveCheckpoint()
 	mc.printFinalStats()
 }
@@ -2653,11 +2857,11 @@ func cleanQuery(values url.Values) string {
 		"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
 		"gclid", "fbclid", "yclid", "_ga",
 	}
-	
+
 	for _, param := range tracking {
 		values.Del(param)
 	}
-	
+
 	return values.Encode()
 }
 
@@ -2674,43 +2878,50 @@ func maxFloat(a, b float64) float64 {
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	
+
 	var (
 		domainFile = flag.String("domains", "", "Domain list file (required)")
 		workers    = flag.Int("workers", 3, "Workers per domain")
 		maxWorkers = flag.Int("max-workers", 300, "Maximum total workers")
 		maxPages   = flag.Int("max-pages", 1000, "Max pages per domain")
-		output     = flag.String("output", "comments_found.jsonl", "Output file")
 		checkpoint = flag.String("checkpoint", "checkpoint.json", "Checkpoint file")
+		proxies    = flag.String("proxies", "", "Proxies list file")
 	)
-	
+
 	flag.Parse()
-	
+
 	if *domainFile == "" {
 		log.Fatal("Domain file is required (-domains flag)")
 	}
-	
+
 	config := DefaultConfig()
+	if *proxies != "" {
+		config.ProxiesFile = *proxies
+		proxyList, err := loadLines(*proxies)
+		if err != nil {
+			log.Fatalf("Failed to load proxies: %v", err)
+		}
+		config.Proxies = proxyList
+	}
 	config.WorkersPerDomain = *workers
 	config.MaxTotalWorkers = *maxWorkers
 	config.MaxPagesPerDomain = *maxPages
-	config.OutputFile = *output
 	config.CheckpointFile = *checkpoint
-	
+
 	crawler, err := NewMainCrawler(config)
 	if err != nil {
 		log.Fatalf("Failed to create crawler: %v", err)
 	}
-	
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	
+
 	go func() {
 		<-sigChan
 		crawler.Shutdown()
 		os.Exit(0)
 	}()
-	
+
 	if err := crawler.Run(*domainFile); err != nil {
 		log.Fatalf("Crawler failed: %v", err)
 	}
