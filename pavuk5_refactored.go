@@ -670,7 +670,7 @@ func NewDomainCrawler(domain string, config *Config, results chan *Finding) *Dom
 
 	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
 	if err != nil {
-		log.Printf("[%s] Failed to create tls client: %v", domain, err)
+		AddLog(fmt.Sprintf("[%s] Failed to create tls client: %v", domain, err))
 		// Fallback to default client
 		client, _ = tls_client.NewHttpClient(tls_client.NewNoopLogger())
 	}
@@ -707,11 +707,11 @@ func (dc *DomainCrawler) seedInitialURLs() {
 		mainURL = "http://" + dc.domain
 		doc, finalURL, err = dc.fetchAndParse(mainURL)
 		if err != nil {
-			log.Printf("[%s] Main page failed, trying sitemap", dc.domain)
+			AddLog(fmt.Sprintf("[%s] Main page failed, trying sitemap", dc.domain))
 			dc.processSitemap()
 
 			if len(dc.queue) == 0 {
-				log.Printf("[%s] No accessible pages found", dc.domain)
+				AddLog(fmt.Sprintf("[%s] No accessible pages found", dc.domain))
 				dc.cancel()
 				return
 			}
@@ -741,7 +741,7 @@ func (dc *DomainCrawler) worker(id int) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[%s] Worker %d recovered from panic: %v", dc.domain, id, r)
+			AddLog(fmt.Sprintf("[%s] Worker %d recovered from panic: %v", dc.domain, id, r))
 			dc.wg.Add(1)
 			go dc.worker(id)
 		}
@@ -772,13 +772,13 @@ func (dc *DomainCrawler) worker(id int) {
 			found := atomic.LoadInt64(&dc.found)
 
 			if found >= 50 {
-				log.Printf("[%s] Found enough comments (%d pages), stopping", dc.domain, found)
+				AddLog(fmt.Sprintf("[%s] Found enough comments (%d pages), stopping", dc.domain, found))
 				dc.cancel()
 				return
 			}
 
 			if pages >= int64(dc.config.MaxPagesPerDomain) {
-				log.Printf("[%s] Reached page limit (%d), found %d comments", dc.domain, pages, found)
+				AddLog(fmt.Sprintf("[%s] Reached page limit (%d), found %d comments", dc.domain, pages, found))
 				dc.cancel()
 				return
 			}
@@ -2025,7 +2025,7 @@ func (dc *DomainCrawler) learnFromSuccess(url string) {
 	// Запоминаем URL как успешный
 	dc.successPatterns.Store(url, true)
 
-	log.Printf("[%s] Learned pattern: %s (count: %d)", dc.domain, pattern, dc.getPatternCount(pattern))
+	AddLog(fmt.Sprintf("[%s] Learned pattern: %s (count: %d)", dc.domain, pattern, dc.getPatternCount(pattern)))
 }
 
 // getPatternCount - получает счетчик для паттерна
@@ -2172,7 +2172,7 @@ func (dc *DomainCrawler) prioritizeLinksByFreshnessEnhanced(links []string, curr
 
 	// Логируем топ-5 для отладки (только если нашли что-то интересное)
 	if len(scored) > 0 && scored[0].patternScore > 0 {
-		log.Printf("[%s] Top prioritized URLs (pattern learning active):", dc.domain)
+		AddLog(fmt.Sprintf("[%s] Top prioritized URLs (pattern learning active):", dc.domain))
 		for i := 0; i < 5 && i < len(scored); i++ {
 			log.Printf("  [%d] Score:%d Pattern:%d Year:%d URL:%s",
 				i+1, scored[i].score, scored[i].patternScore, scored[i].year, scored[i].url)
@@ -2431,11 +2431,11 @@ func (dc *DomainCrawler) monitor() {
 
 				if emptyQueueCount >= 3 {
 					if pages >= 50 || found > 0 {
-						log.Printf("[%s] Completed: %d pages, %d with comments", dc.domain, pages, found)
+						AddLog(fmt.Sprintf("[%s] Completed: %d pages, %d with comments", dc.domain, pages, found))
 						dc.cancel()
 						return
 					} else if pages > 0 {
-						log.Printf("[%s] Insufficient pages (%d), stopping", dc.domain, pages)
+						AddLog(fmt.Sprintf("[%s] Insufficient pages (%d), stopping", dc.domain, pages))
 						dc.cancel()
 						return
 					}
@@ -2445,7 +2445,7 @@ func (dc *DomainCrawler) monitor() {
 			}
 
 			if pages >= int64(dc.config.MaxPagesPerDomain) {
-				log.Printf("[%s] Reached max pages limit (%d)", dc.domain, pages)
+				AddLog(fmt.Sprintf("[%s] Reached max pages limit (%d)", dc.domain, pages))
 				dc.cancel()
 				return
 			}
@@ -2621,7 +2621,7 @@ func (mc *MainCrawler) processDomain(domain string) {
 	if found > 0 {
 		atomic.AddInt64(&mc.findingsTotal, found)
 		atomic.AddInt64(&mc.domainsWithComments, 1)
-		log.Printf("[%s] Completed: %d pages, %d pages with comments", domain, pages, found)
+		AddLog(fmt.Sprintf("[%s] Completed: %d pages, %d pages with comments", domain, pages, found))
 	}
 
 	mc.checkpointMu.Lock()

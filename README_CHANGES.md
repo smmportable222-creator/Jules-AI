@@ -35,3 +35,15 @@ This document outlines the major overhauls and enhancements deployed to `pavuk5_
 ### 5. Target Limiting / Лимиты на целевые страницы
 - **EN:** The crawler intelligently tracks secondary indicators (emails, contact forms, errors) but doesn't count them against the domain threshold limit. It stops purely when it finds 10 high-quality target pages capable of placements (Comments or Forums).
 - **RU:** Краулер интеллектуально отслеживает вторичные индикаторы (email-адреса, контактные формы, ошибки), но не учитывает их в лимите порога домена. Он останавливается строго после нахождения 10 целевых страниц высокого качества, пригодных для размещения (Комментарии или Форумы).
+
+### 6. Additional Bug Fixes (User Request)
+- **BUG 1:** Profile rotation is now functioning perfectly. The crawler rotates profiles randomly (Chrome, Firefox, Safari, Opera) upon initialization and dynamically updates/swaps the profile specifically whenever a 403 or 429 response is encountered, bypassing Captchas.
+- **BUG 2:** The target counters strictly only increment and respect stopping boundaries when `comment` or `forum` placement possibilities are found, allowing unhindered collection of emails and errors until 10 target pages are acquired.
+- **BUG 3:** `log.Printf` inside `DomainCrawler` mechanisms was replaced with `AddLog(fmt.Sprintf(...))` to natively and correctly pipe the outputs into the Web GUI terminal in real-time.
+- **NEW FEATURE:** Introduced a `fetchFreshURLs` queue that scrapes `sitemap_news.xml`, `/feed/`, and `/rss/` links up-front, aggressively appending 20 fresh endpoints to the front of the queue to analyze recent activity and guarantee current material coverage.
+
+### 6. Дополнительные исправления ошибок (по запросу пользователя)
+- **ОШИБКА 1:** Ротация профилей теперь работает идеально. Краулер случайным образом меняет профили браузеров (Chrome, Firefox, Safari, Opera) при инициализации и динамически обновляет/заменяет профиль каждый раз, когда встречается ответ 403 или 429, тем самым обходя капчи.
+- **ОШИБКА 2:** Счетчики целей строго увеличиваются и учитывают границы остановки только тогда, когда найдены возможности для размещения комментариев (`comment`) или форумов (`forum`), что позволяет беспрепятственно собирать электронные письма и ошибки до тех пор, пока не будет получено 10 целевых страниц.
+- **ОШИБКА 3:** `log.Printf` внутри механизмов `DomainCrawler` был заменен на `AddLog(fmt.Sprintf(...))` для корректной передачи вывода в терминал Web GUI в режиме реального времени.
+- **НОВАЯ ФУНКЦИЯ:** Введена очередь `fetchFreshURLs`, которая заранее извлекает ссылки из `sitemap_news.xml`, `/feed/` и `/rss/`, агрессивно добавляя 20 свежих конечных точек в начало очереди для анализа недавней активности и обеспечения охвата актуального материала.

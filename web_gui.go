@@ -140,7 +140,7 @@ func webGuiMain() {
 
 			c, err := NewMainCrawler(config)
 			if err != nil {
-				addLog(fmt.Sprintf("Failed to create crawler: %v", err))
+				AddLog(fmt.Sprintf("Failed to create crawler: %v", err))
 
 				guiMutex.Lock()
 				guiCrawler = nil
@@ -153,7 +153,7 @@ func webGuiMain() {
 			guiMutex.Unlock()
 
 			if err := c.Run(domainFile); err != nil {
-				addLog(fmt.Sprintf("Crawler failed: %v", err))
+				AddLog(fmt.Sprintf("Crawler failed: %v", err))
 			}
 
 			guiMutex.Lock()
@@ -189,7 +189,8 @@ func webGuiMain() {
 	http.ListenAndServe(":8080", nil)
 }
 
-func addLog(msg string) {
+func AddLog(msg string) {
+	log.Println(msg)
 	guiMutex.Lock()
 	guiLogs = append(guiLogs, msg)
 	if len(guiLogs) > 100 {
