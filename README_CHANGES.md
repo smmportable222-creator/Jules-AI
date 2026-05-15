@@ -47,3 +47,21 @@ This document outlines the major overhauls and enhancements deployed to `pavuk5_
 - **ОШИБКА 2:** Счетчики целей строго увеличиваются и учитывают границы остановки только тогда, когда найдены возможности для размещения комментариев (`comment`) или форумов (`forum`), что позволяет беспрепятственно собирать электронные письма и ошибки до тех пор, пока не будет получено 10 целевых страниц.
 - **ОШИБКА 3:** `log.Printf` внутри механизмов `DomainCrawler` был заменен на `AddLog(fmt.Sprintf(...))` для корректной передачи вывода в терминал Web GUI в режиме реального времени.
 - **НОВАЯ ФУНКЦИЯ:** Введена очередь `fetchFreshURLs`, которая заранее извлекает ссылки из `sitemap_news.xml`, `/feed/` и `/rss/`, агрессивно добавляя 20 свежих конечных точек в начало очереди для анализа недавней активности и обеспечения охвата актуального материала.
+
+### 7. Core Strategy Fixes (Strict Request)
+- **FIX 1:** Restored profile array definitions and ensured proper random rotation upon `NewDomainCrawler` creation and directly inside the HTTP `Do` retry loop when encountering 403 or 429 errors.
+- **FIX 2:** Updated default config parameter `MaxPagesPerDomain` to 2000. Removed the `found >= N` stopping condition to allow uninterrupted execution unless 2000 max limit is reached or the queue fully depletes.
+- **FIX 3:** Enforced URL normalization directly before link resolution. Trailing slashes and URI fragments (`#`) are scrubbed, tracking parameters are purged cleanly, and all URLs are upgraded/deduplicated to `https://` schemas natively.
+- **FIX 4:** Enabled full `robots.txt` `Disallow` rule blocklisting to protect the crawler from honeypot or system paths seamlessly.
+- **FIX 5:** Replaced `.WithNotFollowRedirects()` with `.WithCatchPanics()` properly relying on base client handlers to securely follow redirects up to max 5 hops and log the final resulting endpoint properly inside `finalURL`.
+- **FIX 6:** Upgraded internal crawler link queuing handling. If the 10000 capacity queue maxes out, it actively pops an older entry from the tail to insert the new prioritized, highly scored payload link seamlessly.
+- **FIX 7:** Injected a strict pagination trap penalty into URL heuristic scoring (deducting 30 points per depth marker up to depth 10, then instantly discarding any pages deeper than 10 to ensure crawling stays highly relevant and doesn't get infinitely trapped).
+
+### 7. Исправления базовой стратегии (по строгому запросу)
+- **ИСПРАВЛЕНИЕ 1:** Восстановлены определения массивов профилей, обеспечена правильная случайная ротация при создании `NewDomainCrawler` и непосредственно в цикле повторных HTTP `Do` попыток при столкновении с ошибками 403 или 429.
+- **ИСПРАВЛЕНИЕ 2:** Обновлен параметр конфигурации по умолчанию `MaxPagesPerDomain` на 2000. Удалено условие остановки `found >= N`, чтобы обеспечить бесперебойное выполнение до достижения лимита в 2000 страниц или полного исчерпания очереди.
+- **ИСПРАВЛЕНИЕ 3:** Внедрена нормализация URL перед разрешением ссылок. Удалены замыкающие слэши и фрагменты URI (`#`), чисто вычищены параметры отслеживания, а все URL-адреса модернизируются/дедуплицируются до схем `https://`.
+- **ИСПРАВЛЕНИЕ 4:** Включена поддержка блокировки правил `Disallow` из `robots.txt`, чтобы надежно защитить сканер от ловушек или системных путей.
+- **ИСПРАВЛЕНИЕ 5:** Конфигурация `.WithNotFollowRedirects()` заменена на безопасную обработку с поддержкой редиректов (до 5 прыжков) и регистрацией конечного адреса напрямую в `finalURL`.
+- **ИСПРАВЛЕНИЕ 6:** Улучшена обработка добавления в очередь сканера. При заполнении очереди старая запись вытесняется (pop), чтобы освободить место для новых высокоприоритетных URL.
+- **ИСПРАВЛЕНИЕ 7:** Внедрен строгий штраф для ловушек пагинации (вычитание 30 баллов за каждый уровень глубины до 10, затем мгновенный отказ от страниц с глубиной более 10) для удержания высокой релевантности и предотвращения бесконечного зацикливания.

@@ -57,7 +57,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		WorkersPerDomain:   1,
 		MaxTotalWorkers:    500,
-		MaxPagesPerDomain:  1000,
+		MaxPagesPerDomain:  2000,
 		RequestTimeout:     90 * time.Second,
 		DomainTimeout:      30 * time.Minute,
 		RatePerDomain:      3.0,
@@ -109,6 +109,8 @@ type DomainCrawler struct {
 	errors      int64
 	pages       int64
 	found       int64
+	targetCount int64 // Counts actual targets (comments, forums)
+	blocklist   []string
 
 	timeoutErrors  int64
 	networkErrors  int64
@@ -658,8 +660,11 @@ func NewDomainCrawler(domain string, config *Config, results chan *Finding) *Dom
 
 	options := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(int(config.RequestTimeout.Seconds())),
-		tls_client.WithClientProfile(profiles.Chrome_120),
-		tls_client.WithNotFollowRedirects(),
+		// Fix 1: Random profile selection
+		tls_client.WithClientProfile([]profiles.ClientProfile{
+			profiles.Chrome_120, profiles.Firefox_120, profiles.Safari_16_0, profiles.Opera_90,
+		}[rand.Intn(4)]),
+		tls_client.WithCatchPanics(),
 		tls_client.WithInsecureSkipVerify(),
 	}
 
@@ -730,10 +735,71 @@ func (dc *DomainCrawler) seedInitialURLs() {
 		select {
 		case dc.queue <- link:
 		default:
+			AddLog(fmt.Sprintf("[%s] Queue overflow, dropping low priority links", dc.domain))
+			<-dc.queue
+			dc.queue <- link
 		}
 	}
 
+	dc.fetchFreshURLs()
 	dc.processSitemap()
+}
+
+func (dc *DomainCrawler) fetchFreshURLs() {
+	sources := []string{
+		"https://" + dc.domain + "/sitemap_news.xml",
+		"https://" + dc.domain + "/feed/",
+		"https://" + dc.domain + "/rss/",
+	}
+
+	var freshLinks []string
+
+	for _, source := range sources {
+		req, err := http2.NewRequest("GET", source, nil)
+		if err != nil {
+			continue
+		}
+		req = req.WithContext(dc.ctx)
+		ua := dc.config.UserAgents[rand.Intn(len(dc.config.UserAgents))]
+		req.Header.Set("User-Agent", ua)
+		resp, err := dc.client.Do(req)
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
+			continue
+		}
+
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+
+		if strings.HasSuffix(source, ".xml") {
+			dc.extractLinksFromSitemap(body, &freshLinks)
+		} else {
+			re := regexp.MustCompile("<link>(http[^<]+)</link>")
+			matches := re.FindAllSubmatch(body, -1)
+			for _, match := range matches {
+				if len(match) > 1 {
+					freshLinks = append(freshLinks, string(match[1]))
+				}
+			}
+		}
+	}
+
+	// Add fresh links to the front of queue by pushing them immediately
+	for i, link := range freshLinks {
+		if i >= 20 {
+			break
+		}
+		select {
+		case dc.queue <- link:
+		default:
+		}
+	}
 }
 
 func (dc *DomainCrawler) worker(id int) {
@@ -771,8 +837,11 @@ func (dc *DomainCrawler) worker(id int) {
 			pages := atomic.LoadInt64(&dc.pages)
 			found := atomic.LoadInt64(&dc.found)
 
-			if found >= 50 {
-				AddLog(fmt.Sprintf("[%s] Found enough comments (%d pages), stopping", dc.domain, found))
+			targetCount := atomic.LoadInt64(&dc.targetCount)
+
+			// Останавливаемся если набрали 10 целевых (комментарии, статьи, форумы)
+			if targetCount >= 10 {
+				AddLog(fmt.Sprintf("[%s] Found enough target pages (%d targets in %d pages), stopping", dc.domain, targetCount, pages))
 				dc.cancel()
 				return
 			}
@@ -872,6 +941,9 @@ func (dc *DomainCrawler) processURL(url string) {
 	for _, finding := range findings {
 		dc.results <- finding
 		atomic.AddInt64(&dc.found, 1)
+		if finding.Category == "comment" || finding.Category == "forum" {
+			atomic.AddInt64(&dc.targetCount, 1)
+		}
 	}
 
 	// Продолжаем обход для стратегии "умри, но найди"
@@ -1088,18 +1160,16 @@ func (dc *DomainCrawler) fetchAndParse(urlStr string) (*goquery.Document, string
 			}
 			return nil, "", err
 		}
-		defer resp.Body.Close()
 
-		if resp.StatusCode >= 400 {
-			return nil, "", fmt.Errorf("status %d", resp.StatusCode)
-		}
-
+		// Read body to check for blocks BEFORE parsing
 		reader, err := charset.NewReader(resp.Body, resp.Header.Get("Content-Type"))
 		if err != nil {
 			reader = resp.Body
 		}
 
 		body, err := io.ReadAll(io.LimitReader(reader, 10*1024*1024))
+		resp.Body.Close() // Close early since we read it all
+
 		if err != nil {
 			lastErr = err
 			if attempt < dc.config.RetryAttempts {
@@ -1107,6 +1177,63 @@ func (dc *DomainCrawler) fetchAndParse(urlStr string) (*goquery.Document, string
 				continue
 			}
 			return nil, "", err
+		}
+
+		bodyStr := string(body)
+		isBlocked := false
+		var blockReason string
+
+		if resp.StatusCode == 403 || resp.StatusCode == 429 {
+			isBlocked = true
+			blockReason = fmt.Sprintf("status %d", resp.StatusCode)
+		} else if strings.Contains(bodyStr, "Just a moment") {
+			isBlocked = true
+			blockReason = "Cloudflare JS Challenge"
+		} else if strings.Contains(bodyStr, "Access Denied") || strings.Contains(bodyStr, "Forbidden") {
+			isBlocked = true
+			blockReason = "Access Denied"
+		} else if len(body) < 500 && resp.StatusCode == 200 && strings.Contains(strings.ToLower(bodyStr), "captcha") {
+			isBlocked = true
+			blockReason = "Captcha / Short body"
+		} else if resp.Header.Get("cf-ray") != "" && resp.StatusCode > 200 {
+			isBlocked = true
+			blockReason = "CF-Ray block"
+		}
+
+		if isBlocked {
+			AddLog(fmt.Sprintf("[%s] Block detected: %s", dc.domain, blockReason))
+			lastErr = fmt.Errorf("blocked: %s", blockReason)
+
+			// Wait random 5-15 seconds
+			time.Sleep(time.Duration(rand.Intn(10000)+5000) * time.Millisecond)
+
+			// Rotate to different browser profile
+			clientProfiles := []profiles.ClientProfile{
+				profiles.Chrome_120, profiles.Firefox_120, profiles.Safari_16_0, profiles.Opera_90,
+			}
+			randomProfile := clientProfiles[rand.Intn(len(clientProfiles))]
+			options := []tls_client.HttpClientOption{
+				tls_client.WithTimeoutSeconds(int(dc.config.RequestTimeout.Seconds())),
+				tls_client.WithClientProfile(randomProfile),
+				tls_client.WithCatchPanics(),
+				tls_client.WithInsecureSkipVerify(),
+			}
+			if len(dc.config.Proxies) > 0 {
+				proxy := dc.config.Proxies[rand.Intn(len(dc.config.Proxies))]
+				options = append(options, tls_client.WithProxyUrl(proxy))
+			}
+			if newClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...); err == nil {
+				dc.client = newClient
+			}
+
+			if attempt < dc.config.RetryAttempts {
+				continue
+			}
+			return nil, "", lastErr
+		}
+
+		if resp.StatusCode >= 400 {
+			return nil, "", fmt.Errorf("status %d", resp.StatusCode)
 		}
 
 		doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
@@ -1806,6 +1933,20 @@ func (dc *DomainCrawler) extractLinks(doc *goquery.Document, baseURL string) []s
 
 		absolute.Fragment = ""
 		absolute.RawQuery = cleanQuery(absolute.Query())
+		// Fix 3: trailing slash differences
+		absolute.Path = strings.TrimSuffix(absolute.Path, "/")
+		if absolute.Path == "" {
+			absolute.Path = "/"
+		}
+		// Fix 3: protocol differences - unify on https for deduplication purposes inside queue
+		absolute.Scheme = "https"
+
+		// Fix 4: Respect robots.txt blocklist
+		for _, blocked := range dc.blocklist {
+			if strings.HasPrefix(absolute.Path, blocked) {
+				return
+			}
+		}
 
 		path := strings.ToLower(absolute.Path)
 		skipExts := []string{
@@ -2403,6 +2544,14 @@ func (dc *DomainCrawler) processRobotsTxt(allLinks *[]string) {
 				// Добавляем разрешённые пути для исследования
 				fullURL := "https://" + dc.domain + path
 				*allLinks = append(*allLinks, fullURL)
+			}
+		}
+
+		if userAgentBlock && strings.HasPrefix(line, "disallow:") {
+			path := strings.TrimSpace(line[9:])
+			if path != "" {
+				// Fix 4: Add to blocklist
+				dc.blocklist = append(dc.blocklist, path)
 			}
 		}
 	}
