@@ -65,3 +65,15 @@ This document outlines the major overhauls and enhancements deployed to `pavuk5_
 - **ИСПРАВЛЕНИЕ 5:** Конфигурация `.WithNotFollowRedirects()` заменена на безопасную обработку с поддержкой редиректов (до 5 прыжков) и регистрацией конечного адреса напрямую в `finalURL`.
 - **ИСПРАВЛЕНИЕ 6:** Улучшена обработка добавления в очередь сканера. При заполнении очереди старая запись вытесняется (pop), чтобы освободить место для новых высокоприоритетных URL.
 - **ИСПРАВЛЕНИЕ 7:** Внедрен строгий штраф для ловушек пагинации (вычитание 30 баллов за каждый уровень глубины до 10, затем мгновенный отказ от страниц с глубиной более 10) для удержания высокой релевантности и предотвращения бесконечного зацикливания.
+
+### 8. Web GUI Enhancements & Launchers (User Request)
+- **NEW LAUNCHERS:** Added `start.bat` (Windows) and `start.sh` (macOS/Linux) scripts. These files allow launching the entire crawler compilation and web panel with a single double-click. They automatically build the `pavuk5` executable, open `http://localhost:8080` securely in the default web browser, and attach the GUI listener.
+- **LIVE STATISTICS:** Extensively updated the Web GUI page template to support visual, real-time tracking metrics cleanly structured in CSS grids. Total targeted elements, errors, total pages crawled, and domain progression fractions are dynamically queried directly into the dashboard every 1.5 seconds.
+
+### 8. Улучшения веб-интерфейса и лаунчеры (по запросу пользователя)
+- **НОВЫЕ ЛАУНЧЕРЫ:** Добавлены скрипты `start.bat` (Windows) и `start.sh` (macOS/Linux). Эти файлы позволяют запустить всю компиляцию краулера и веб-панель одним двойным щелчком мыши. Они автоматически собирают исполняемый файл `pavuk5`, безопасно открывают `http://localhost:8080` в браузере по умолчанию и запускают слушатель GUI.
+- **ЖИВАЯ СТАТИСТИКА:** Значительно обновлен шаблон страницы Web GUI для поддержки визуальных, отслеживаемых в реальном времени метрик, аккуратно структурированных с помощью CSS-сеток. Общее количество целевых элементов, ошибки, общее количество просканированных страниц и доли продвижения по доменам динамически запрашиваются прямо в дашборд каждые 1,5 секунды.
+
+### 9. Extended Multi-Language Support
+- **EN:** Massively expanded the `patterns.json` language pool. The crawler's semantic and contact form detections now natively recognize 8 additional languages: Italian, Portuguese, Polish, Dutch, Turkish, Japanese, Chinese, and Korean. This broadens the funnel depth to accurately identify commenting platforms globally.
+- **RU:** Значительно расширен языковой пул `patterns.json`. Семантические алгоритмы и фильтры контактных форм краулера теперь нативно распознают 8 дополнительных языков: итальянский, португальский, польский, нидерландский, турецкий, японский, китайский и корейский. Это расширяет охват воронки для точного определения платформ комментирования по всему миру.

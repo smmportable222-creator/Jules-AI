@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 var (
@@ -30,13 +31,26 @@ const htmlTemplate = `
         input[type="text"], input[type="number"], textarea { width: 100%; padding: 8px; margin-top: 5px; box-sizing: border-box; }
         button { margin-top: 20px; padding: 10px 20px; background-color: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; }
         button.stop { background-color: #dc3545; }
-        .log-box { margin-top: 20px; background: #222; color: #0f0; padding: 10px; height: 300px; overflow-y: scroll; font-family: monospace; }
-        .status { margin-top: 20px; font-weight: bold; }
+        .log-box { margin-top: 20px; background: #222; color: #0f0; padding: 10px; height: 300px; overflow-y: scroll; font-family: monospace; border-radius: 4px; }
+        .status { margin-top: 20px; font-size: 1.2em; }
+        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-top: 20px; margin-bottom: 20px;}
+        .stat-box { background: #e9ecef; padding: 15px; border-radius: 8px; text-align: center; }
+        .stat-val { font-size: 1.5em; font-weight: bold; color: #007bff; }
     </style>
 </head>
 <body>
 <div class="container">
     <h1>Pavuk Web Crawler</h1>
+
+    <div class="status">Status: <strong id="runStatus">{{.Status}}</strong></div>
+
+    <div class="stats-grid">
+        <div class="stat-box">Domains<div class="stat-val" id="statDomains">0 / 0</div></div>
+        <div class="stat-box">Pages Crawled<div class="stat-val" id="statPages">0</div></div>
+        <div class="stat-box">Target Hits<div class="stat-val" id="statFindings">0</div></div>
+        <div class="stat-box">Errors<div class="stat-val" id="statErrors">0</div></div>
+    </div>
+
     <form id="crawlerForm" method="POST" action="/start">
         <label>Domains (one per line):</label>
         <textarea name="domains" rows="5">example.com</textarea>
@@ -60,8 +74,6 @@ const htmlTemplate = `
         <button class="stop" type="submit">Stop Crawler</button>
     </form>
 
-    <div class="status">Status: {{.Status}}</div>
-
     <div class="log-box" id="logBox">
         {{range .Logs}}
             <div>{{.}}</div>
@@ -70,17 +82,23 @@ const htmlTemplate = `
 </div>
 <script>
     setInterval(function(){
-        fetch('/logs').then(r => r.json()).then(data => {
+        fetch('/api/data').then(r => r.json()).then(data => {
+            document.getElementById('runStatus').textContent = data.Status;
+            document.getElementById('statDomains').textContent = data.DomainsDone + " / " + data.DomainsTotal;
+            document.getElementById('statPages').textContent = data.Pages;
+            document.getElementById('statFindings').textContent = data.Findings;
+            document.getElementById('statErrors').textContent = data.Errors;
+
             const box = document.getElementById('logBox');
             box.innerHTML = '';
-            data.forEach(line => {
+            data.Logs.forEach(line => {
                 const d = document.createElement('div');
                 d.textContent = line;
                 box.appendChild(d);
             });
             box.scrollTop = box.scrollHeight;
         });
-    }, 2000);
+    }, 1500);
 </script>
 </body>
 </html>
@@ -175,14 +193,34 @@ func webGuiMain() {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	})
 
-	http.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/data", func(w http.ResponseWriter, r *http.Request) {
 		guiMutex.Lock()
+		status := "Idle"
+		var domainsTotal, domainsDone, pages, findings, errors int64
+
+		if guiCrawler != nil {
+			status = "Running"
+			domainsTotal = atomic.LoadInt64(&guiCrawler.domainsTotal)
+			domainsDone = atomic.LoadInt64(&guiCrawler.domainsDone)
+			pages = atomic.LoadInt64(&guiCrawler.pagesTotal)
+			findings = atomic.LoadInt64(&guiCrawler.findingsTotal)
+			errors = atomic.LoadInt64(&guiCrawler.errorsTotal)
+		}
+
 		logsCopy := make([]string, len(guiLogs))
 		copy(logsCopy, guiLogs)
 		guiMutex.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(logsCopy)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"Status":       status,
+			"DomainsTotal": domainsTotal,
+			"DomainsDone":  domainsDone,
+			"Pages":        pages,
+			"Findings":     findings,
+			"Errors":       errors,
+			"Logs":         logsCopy,
+		})
 	})
 
 	log.Println("Starting Web GUI on http://localhost:8080")
