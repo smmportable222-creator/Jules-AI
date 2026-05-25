@@ -1,0 +1,617 @@
+{
+  "url_patterns": {
+    "high_probability": [
+      {
+        "pattern": "/blog/",
+        "weight": 0.4,
+        "is_regex": false
+      },
+      {
+        "pattern": "/post/",
+        "weight": 0.4,
+        "is_regex": false
+      },
+      {
+        "pattern": "/article/",
+        "weight": 0.35,
+        "is_regex": false
+      },
+      {
+        "pattern": "/news/",
+        "weight": 0.3,
+        "is_regex": false
+      },
+      {
+        "pattern": "/\\\\d{4}/\\\\d{2}/",
+        "weight": 0.35,
+        "is_regex": true
+      },
+      {
+        "pattern": "/entry/",
+        "weight": 0.3,
+        "is_regex": false
+      },
+      {
+        "pattern": "/story/",
+        "weight": 0.3,
+        "is_regex": false
+      },
+      {
+        "pattern": "forum",
+        "weight": 0.4,
+        "is_regex": false
+      },
+      {
+        "pattern": "board",
+        "weight": 0.3,
+        "is_regex": false
+      },
+      {
+        "pattern": "/noticias/",
+        "weight": 0.3,
+        "is_regex": false
+      },
+      {
+        "pattern": "/nouvelles/",
+        "weight": 0.3,
+        "is_regex": false
+      },
+      {
+        "pattern": "/nachrichten/",
+        "weight": 0.3,
+        "is_regex": false
+      }
+    ],
+    "medium_probability": [
+      {
+        "pattern": "/review",
+        "weight": 0.2,
+        "is_regex": false
+      },
+      {
+        "pattern": "/product/",
+        "weight": 0.15,
+        "is_regex": false
+      },
+      {
+        "pattern": "/topic/",
+        "weight": 0.2,
+        "is_regex": false
+      },
+      {
+        "pattern": "/discussion/",
+        "weight": 0.3,
+        "is_regex": false
+      },
+      {
+        "pattern": "/page/",
+        "weight": 0.1,
+        "is_regex": false
+      },
+      {
+        "pattern": "/tema/",
+        "weight": 0.2,
+        "is_regex": false
+      },
+      {
+        "pattern": "/diskussion/",
+        "weight": 0.3,
+        "is_regex": false
+      }
+    ],
+    "low_probability": [
+      {
+        "pattern": "/contact",
+        "weight": -0.3,
+        "is_regex": false
+      },
+      {
+        "pattern": "/about",
+        "weight": -0.2,
+        "is_regex": false
+      },
+      {
+        "pattern": "/search",
+        "weight": -0.4,
+        "is_regex": false
+      },
+      {
+        "pattern": "/category/",
+        "weight": 0.05,
+        "is_regex": false
+      },
+      {
+        "pattern": "/tag/",
+        "weight": 0.05,
+        "is_regex": false
+      },
+      {
+        "pattern": "/archive/",
+        "weight": 0.05,
+        "is_regex": false
+      },
+      {
+        "pattern": "/kontakt",
+        "weight": -0.3,
+        "is_regex": false
+      },
+      {
+        "pattern": "/contacto",
+        "weight": -0.3,
+        "is_regex": false
+      }
+    ],
+    "system_pages": [
+      {
+        "pattern": "/login",
+        "weight": -0.5,
+        "is_regex": false
+      },
+      {
+        "pattern": "/register",
+        "weight": -0.5,
+        "is_regex": false
+      },
+      {
+        "pattern": "/admin",
+        "weight": -0.6,
+        "is_regex": false
+      },
+      {
+        "pattern": "/privacy",
+        "weight": -0.4,
+        "is_regex": false
+      },
+      {
+        "pattern": "/terms",
+        "weight": -0.4,
+        "is_regex": false
+      },
+      {
+        "pattern": "/subscribe",
+        "weight": -0.35,
+        "is_regex": false
+      },
+      {
+        "pattern": "/unsubscribe",
+        "weight": -0.5,
+        "is_regex": false
+      },
+      {
+        "pattern": "/checkout",
+        "weight": -0.6,
+        "is_regex": false
+      },
+      {
+        "pattern": "/cart",
+        "weight": -0.6,
+        "is_regex": false
+      },
+      {
+        "pattern": "/support",
+        "weight": -0.3,
+        "is_regex": false
+      },
+      {
+        "pattern": "/help",
+        "weight": -0.3,
+        "is_regex": false
+      },
+      {
+        "pattern": "/faq",
+        "weight": -0.3,
+        "is_regex": false
+      }
+    ]
+  },
+  "semantics": {
+    "comment_keywords": [
+      "leave a comment",
+      "add comment",
+      "post comment",
+      "share your thoughts",
+      "join the discussion",
+      "what do you think",
+      "your opinion",
+      "оставить комментарий",
+      "добавить комментарий",
+      "ваше мнение",
+      "поделитесь мыслями",
+      "write a review",
+      "leave feedback",
+      "comment",
+      "dejar un comentario",
+      "añadir comentario",
+      "laisser un commentaire",
+      "ajouter un commentaire",
+      "kommentar hinterlassen",
+      "kommentar hinzufügen",
+      "lascia un commento",
+      "aggiungi commento",
+      "scrivi una recensione",
+      "deixe um comentário",
+      "adicionar comentário",
+      "escreva um comentário",
+      "zostaw komentarz",
+      "dodaj komentarz",
+      "napisz opinię",
+      "laat een reactie achter",
+      "reactie toevoegen",
+      "schrijf een review",
+      "yorum bırakın",
+      "yorum ekle",
+      "fikrini paylaş",
+      "コメントを残す",
+      "コメントを追加",
+      "发表评论",
+      "添加评论",
+      "留下评论",
+      "댓글을 남겨주세요",
+      "댓글 작성"
+    ],
+    "contact_keywords": [
+      "contact us",
+      "get in touch",
+      "reach out",
+      "send us a message",
+      "inquiry",
+      "support request",
+      "свяжитесь с нами",
+      "написать нам",
+      "обратная связь",
+      "задать вопрос",
+      "техподдержка",
+      "contáctenos",
+      "contactez-nous",
+      "kontaktiere uns",
+      "contattaci",
+      "inviaci un messaggio",
+      "richiesta di supporto",
+      "contate-nos",
+      "fale conosco",
+      "suporte",
+      "skontaktuj się z nami",
+      "wyślij wiadomość",
+      "wsparcie",
+      "neem contact met ons op",
+      "stuur ons een bericht",
+      "klantenservice",
+      "bize ulaşın",
+      "iletişim",
+      "destek",
+      "お問い合わせ",
+      "連絡先",
+      "联系我们",
+      "联系方式",
+      "发送消息",
+      "연락하기",
+      "고객지원",
+      "문의하기"
+    ]
+  },
+  "modern_systems": {
+    "disqus": [
+      "#disqus_thread",
+      ".disqus",
+      "disqus.com/embed",
+      "disqus_config",
+      "dsq-",
+      "disqus-comment"
+    ],
+    "facebook": [
+      ".fb-comments",
+      "#fb-root",
+      "facebook.com/plugins/comments",
+      "fb:comments",
+      "class=\"fb-comments\""
+    ],
+    "vk": [
+      "#vk_comments",
+      ".vk_comments",
+      "VK.Widgets.Comments",
+      "vk.com/widget_comments",
+      "vk_comments"
+    ],
+    "wordpress": [
+      "#commentform",
+      "#respond",
+      ".comment-respond",
+      "comment-reply-link",
+      "wp-comment",
+      "wp-comment-",
+      "wordpress-comment",
+      "#comments-title"
+    ],
+    "commento": [
+      "#commento",
+      ".commento",
+      "commento.io",
+      "commento-root",
+      "data-commento"
+    ],
+    "utterances": [
+      ".utterances",
+      "utterances-frame",
+      "utteranc.es"
+    ],
+    "giscus": [
+      ".giscus",
+      "giscus-frame",
+      "giscus.app"
+    ],
+    "remark42": [
+      "#remark42",
+      ".remark42",
+      "remark42__root"
+    ],
+    "hyvor": [
+      "hyvor-talk",
+      "talk.hyvor.com",
+      "hyvor-talk-comments"
+    ],
+    "cusdis": [
+      "#cusdis_thread",
+      ".cusdis",
+      "cusdis.com",
+      "data-host=\"cusdis",
+      "cusdis-root"
+    ],
+    "waline": [
+      "#waline",
+      ".waline",
+      "waline-comment",
+      "waline.js",
+      "@waline/client"
+    ],
+    "twikoo": [
+      "#twikoo",
+      ".twikoo",
+      "twikoo-container",
+      "twikoo.js",
+      "twikoo-comment"
+    ],
+    "artalk": [
+      "#artalk",
+      ".artalk",
+      "artalk-comment",
+      "artalk.js",
+      "artalk-container"
+    ],
+    "isso": [
+      "#isso-thread",
+      ".isso-comment",
+      "data-isso",
+      "isso-postbox",
+      "embed.min.js"
+    ],
+    "schnack": [
+      ".schnack-comments",
+      "#schnack-comments",
+      "schnack.js",
+      "data-schnack"
+    ],
+    "livere": [
+      "#lv-container",
+      ".livere",
+      "livere.com",
+      "livere-comment",
+      "city.livere.com"
+    ],
+    "hypercomments": [
+      "#hypercomments_widget",
+      "hypercomments.com",
+      ".hc-comment",
+      "hypercomments_mix"
+    ],
+    "yandex": [
+      "ya-comments",
+      "yandex.ru/comments",
+      "yandex-comments-widget"
+    ],
+    "drupal": [
+      "#comments",
+      ".comment-wrapper",
+      "drupal-comment",
+      ".comment-form",
+      "#comment-form"
+    ],
+    "joomla": [
+      "#jcomments",
+      ".jcomments",
+      "com_jcomments"
+    ],
+    "ghost": [
+      "#ghost-comments",
+      ".ghost-comments",
+      "data-ghost-comment"
+    ],
+    "react_comments": [
+      "data-reactroot",
+      "__react-comment",
+      "react-comment-",
+      "CommentSection",
+      "CommentBox",
+      "CommentList"
+    ],
+    "vue_comments": [
+      "v-comment",
+      "vue-comment",
+      "comment-component",
+      "data-v-",
+      "_comment_",
+      "__vue__"
+    ],
+    "telegram": [
+      ".telegram-comments",
+      "comments.app",
+      "tg-comments"
+    ],
+    "coral": [
+      "coral-embed-stream",
+      "coral-comment",
+      "coralproject"
+    ],
+    "cackle": [
+      "#mc-container",
+      ".cackle_widget",
+      "cackle.me",
+      "cackle-comment",
+      "mc-comment"
+    ],
+    "muut": [
+      ".muut",
+      "#muut",
+      "muut.com",
+      "muut-widget"
+    ],
+    "spot.im": [
+      "spot-im",
+      "spotim",
+      "spot-im-frame",
+      "data-spot-im",
+      "spotim_launcher"
+    ]
+  },
+  "forums": [
+    "phpbb",
+    "vbulletin",
+    "xenforo",
+    "discourse",
+    "smf",
+    "mybb",
+    "ips_focus",
+    "ip.board",
+    "invision power board",
+    "flarum",
+    "vanilla forums",
+    "yaf.net",
+    "bbpress",
+    "kunena"
+  ],
+  "contact_form": {
+    "phone": [
+      "phone",
+      "tel",
+      "mobile",
+      "telefon",
+      "téléphone",
+      "teléfono",
+      "telefono",
+      "telefone",
+      "telefon",
+      "telefoon",
+      "telefon",
+      "電話",
+      "电话",
+      "전화"
+    ],
+    "subject": [
+      "subject",
+      "title",
+      "topic",
+      "asunto",
+      "sujet",
+      "betreff",
+      "oggetto",
+      "assunto",
+      "temat",
+      "onderwerp",
+      "konu",
+      "件名",
+      "主题",
+      "제목"
+    ],
+    "company": [
+      "company",
+      "organization",
+      "business",
+      "empresa",
+      "entreprise",
+      "firma",
+      "azienda",
+      "empresa",
+      "firma",
+      "bedrijf",
+      "şirket",
+      "会社",
+      "公司",
+      "회사"
+    ],
+    "email": [
+      "email",
+      "mail",
+      "correo",
+      "e-mail"
+    ],
+    "name": [
+      "name",
+      "first",
+      "last",
+      "user",
+      "nombre",
+      "nom",
+      "name",
+      "nome",
+      "nome",
+      "imię",
+      "nazwisko",
+      "naam",
+      "isim",
+      "名前",
+      "姓名",
+      "이름"
+    ],
+    "message": [
+      "message",
+      "inquiry",
+      "question",
+      "mensaje",
+      "nachricht",
+      "messaggio",
+      "mensagem",
+      "wiadomość",
+      "bericht",
+      "mesaj",
+      "メッセージ",
+      "消息",
+      "메시지"
+    ],
+    "submit_buttons": [
+      "contact",
+      "send",
+      "inquiry",
+      "get in touch",
+      "enviar",
+      "envoyer",
+      "senden",
+      "invia",
+      "enviar",
+      "wyślij",
+      "verzenden",
+      "gönder",
+      "送信",
+      "发送",
+      "제출"
+    ],
+    "negative_buttons": [
+      "comment",
+      "reply",
+      "discuss",
+      "comentar",
+      "responder",
+      "antworten",
+      "commenta",
+      "comente",
+      "skomentuj",
+      "reageren",
+      "yorum yap",
+      "コメントする",
+      "评论",
+      "댓글"
+    ]
+  },
+  "learning": {
+    "boost_max": 15,
+    "confidence_threshold": 0.2
+  }
+}
